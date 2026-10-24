@@ -1,0 +1,123 @@
+{
+  "entities": [
+    {
+      "symbol_class": 2,
+      "symbol_bbox": [
+        124.0,
+        275.0,
+        30,
+        30
+      ],
+      "locked": 0,
+      "text_bbox": [
+        91.94,
+        238.8,
+        78,
+        26
+      ],
+      "identifier": "050380"
+    },
+    {
+      "symbol_class": 3,
+      "symbol_bbox": [
+        619.5,
+        510.5,
+        35,
+        35
+      ],
+      "locked": 0,
+      "text_bbox": [
+        598.27,
+        555.27,
+        78,
+        26
+      ],
+      "identifier": "154171"
+    },
+    {
+      "symbol_class": 2,
+      "symbol_bbox": [
+        974.5,
+        112.5,
+        35,
+        35
+      ],
+      "locked": 0,
+      "text_bbox": [
+        1021.66,
+        135.54,
+        78,
+        26
+      ],
+      "identifier": "046649"
+    },
+    {
+      "symbol_class": 0,
+      "symbol_bbox": [
+        379.5,
+        597.5,
+        23,
+        23
+      ],
+      "locked": 0,
+      "text_bbox": [
+        411.67,
+        591.18,
+        65,
+        26
+      ],
+      "identifier": "71230"
+    },
+    {
+      "symbol_class": 2,
+      "symbol_bbox": [
+        417.5,
+        381.5,
+        23,
+        23
+      ],
+      "locked": 1,
+      "text_bbox": [
+        330.36,
+        395.86,
+        78,
+        26
+      ],
+      "identifier": "341004"
+    },
+    {
+      "symbol_class": 1,
+      "symbol_bbox": [
+        425.5,
+        506.5,
+        27,
+        27
+      ],
+      "locked": 0,
+      "text_bbox": [
+        398.1,
+        544.63,
+        78,
+        26
+      ],
+      "identifier": "554776"
+    },
+    {
+      "symbol_class": 3,
+      "symbol_bbox": [
+        943.5,
+        392.5,
+        25,
+        25
+      ],
+      "locked": 1,
+      "text_bbox": [
+        857.52,
+        392.43,
+        74,
+        26
+      ],
+      "identifier": "811127"
+    }
+  ]
+}

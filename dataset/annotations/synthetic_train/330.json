@@ -1,0 +1,140 @@
+{
+  "entities": [
+    {
+      "symbol_class": 3,
+      "symbol_bbox": [
+        524.5,
+        417.5,
+        27,
+        27
+      ],
+      "locked": 1,
+      "text_bbox": [
+        490.96,
+        455.18,
+        78,
+        26
+      ],
+      "identifier": "259892"
+    },
+    {
+      "symbol_class": 1,
+      "symbol_bbox": [
+        317.5,
+        579.5,
+        35,
+        35
+      ],
+      "locked": 0,
+      "text_bbox": [
+        228.72,
+        606.57,
+        78,
+        26
+      ],
+      "identifier": "298735"
+    },
+    {
+      "symbol_class": 3,
+      "symbol_bbox": [
+        470.5,
+        219.5,
+        27,
+        27
+      ],
+      "locked": 0,
+      "text_bbox": [
+        395.86,
+        241.38,
+        65,
+        26
+      ],
+      "identifier": "29398"
+    },
+    {
+      "symbol_class": 2,
+      "symbol_bbox": [
+        1067.0,
+        105.0,
+        34,
+        34
+      ],
+      "locked": 0,
+      "text_bbox": [
+        1039.19,
+        151.26,
+        65,
+        26
+      ],
+      "identifier": "91434"
+    },
+    {
+      "symbol_class": 1,
+      "symbol_bbox": [
+        684.0,
+        124.0,
+        34,
+        34
+      ],
+      "locked": 0,
+      "text_bbox": [
+        658.86,
+        86.99,
+        78,
+        26
+      ],
+      "identifier": "909071"
+    },
+    {
+      "symbol_class": 3,
+      "symbol_bbox": [
+        348.5,
+        269.5,
+        35,
+        35
+      ],
+      "locked": 1,
+      "text_bbox": [
+        394.91,
+        290.89,
+        78,
+        26
+      ],
+      "identifier": "395216"
+    },
+    {
+      "symbol_class": 1,
+      "symbol_bbox": [
+        370.5,
+        592.5,
+        31,
+        31
+      ],
+      "locked": 0,
+      "text_bbox": [
+        411.91,
+        566.73,
+        78,
+        26
+      ],
+      "identifier": "519745"
+    },
+    {
+      "symbol_class": 0,
+      "symbol_bbox": [
+        551.5,
+        218.5,
+        21,
+        21
+      ],
+      "locked": 0,
+      "text_bbox": [
+        582.21,
+        202.48,
+        78,
+        26
+      ],
+      "identifier": "821884"
+    }
+  ]
+}

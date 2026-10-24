@@ -1,0 +1,31 @@
+dataset_root: dataset
+train_split: synthetic_train
+val_split: synthetic_val
+image_size: [540, 960]
+
+device: auto
+epochs: 100
+batch_size: 4
+workers: 0
+
+pretrained_backbone: true
+learning_rate: 0.0001
+backbone_learning_rate: 0.00001
+weight_decay: 0.0001
+max_grad_norm: 0.1
+eos_coef: 0.5
+
+# 前几轮先让分类和双框稳定，再把CTC损失加入反向传播。
+ctc_warmup_epochs: 5
+ctc_weight: 1.0
+
+# 前50轮让匹配query使用真实文字框训练OCR，此后切换到预测文字框。
+ocr_gt_box_epochs: 50
+
+# 实体评估阈值，正式实验时固定后不要根据测试集反复调整。
+entity_conf_threshold: 0.5
+symbol_iou_threshold: 0.5
+text_iou_threshold: 0.5
+lock_threshold: 0.5
+
+patience: 20

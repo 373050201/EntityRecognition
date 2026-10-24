@@ -1,0 +1,56 @@
+model_name: rtdetrv2_r18vd
+pretrained_weights: weights/rtdetrv2_r18vd_120e_coco.pth
+num_classes: 4
+num_queries: 100
+ocr_sequence_length: 24
+
+text_reference_offset_scale: 5.0
+text_reference_jitter_scale: 0.2 # 改为0.0则取消训练时框的随机抖动，即V1-A
+text_first_layer_sampling_scale: 5.0
+text_refine_sampling_scale: 0.5
+# V2-A保持none；其他取值bidirectional/symbol_to_text，只用于复现V1-C/V1-D。
+region_interaction_mode: none
+region_interaction_init_scale: 0.001
+# 固定为cross_attention：V1-B为none；V2阶段均使用token指导OCR。
+ocr_guidance_mode: cross_attention
+ocr_guidance_num_heads: 4
+# V2-A为none；V2-B为dynamic；V2-C为text_only，固定在g=0端点。
+ocr_guidance_gate_mode: text_only
+
+dataset_root: dataset
+train_split: synthetic_train
+val_split: synthetic_val
+image_size: [540, 960]
+
+device: auto
+# 训练复现种子；需要更换实验种子时只修改这里。
+random_seed: 42
+epochs: 200
+batch_size: 4
+workers: 0
+
+learning_rate: 0.0001
+backbone_learning_rate: 0.00001
+# 断点续训后的学习率。
+resume_learning_rate: 0.0001
+resume_backbone_learning_rate: 0.00001
+weight_decay: 0.0001
+max_grad_norm: 0.1
+
+text_bbox_coef: 10.0
+text_giou_coef: 4.0
+locked_coef: 1.0
+ctc_weight: 1.0
+
+# 前几轮先让检测和双框稳定，再把CTC损失加入反向传播。
+ctc_warmup_epochs: 5
+
+# 前50轮让匹配query使用真实文字框训练OCR，此后切换到预测文字框。
+ocr_gt_box_epochs: 50
+
+entity_conf_threshold: 0.5
+symbol_iou_threshold: 0.5
+text_iou_threshold: 0.5
+lock_threshold: 0.5
+
+patience: 20

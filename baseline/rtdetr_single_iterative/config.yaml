@@ -1,0 +1,42 @@
+experiment_name: exp2_single_iterative
+text_box_mode: iterative_symbol_query
+
+model_name: rtdetrv2_r18vd
+pretrained_weights: D:/Python projects/EntityRecognition/weights/rtdetrv2_r18vd_120e_coco.pth
+num_classes: 4
+num_queries: 100
+ocr_sequence_length: 24
+
+dataset_root: D:/Python projects/EntityRecognition/dataset
+train_split: synthetic_train
+val_split: synthetic_val
+image_size: [540, 960]
+
+device: auto
+random_seed: 42
+epochs: 200
+batch_size: 4
+workers: 0
+
+learning_rate: 0.0001
+backbone_learning_rate: 0.00001
+resume_learning_rate: 0.0001
+resume_backbone_learning_rate: 0.00001
+weight_decay: 0.0001
+max_grad_norm: 0.1
+
+# 与实验1保持相同损失权重，仅改变文字框回归结构。
+text_bbox_coef: 10.0
+text_giou_coef: 4.0
+locked_coef: 1.0
+ctc_weight: 1.0
+
+ctc_warmup_epochs: 5
+ocr_gt_box_epochs: 50
+
+entity_conf_threshold: 0.5
+symbol_iou_threshold: 0.5
+text_iou_threshold: 0.5
+lock_threshold: 0.5
+
+patience: 20

@@ -1,0 +1,9 @@
+path: ..
+train: images/synthetic_train
+val: images/synthetic_val
+
+names:
+  0: RD
+  1: RS
+  2: GD
+  3: GS
