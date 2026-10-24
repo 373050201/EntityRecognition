@@ -4,6 +4,7 @@ debug
 outputs
 *.pt
 *.pth
+!weights/*.pth
 
 # Python cache files
 __pycache__/
