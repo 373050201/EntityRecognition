@@ -1,0 +1,53 @@
+dataset_root: ../../dataset
+dataset_config: data_yolo.yaml
+model_path: best_yolo11s.pt
+pretrained_model: yolo11s.pt
+cleanup_models: [yolo11s.pt]
+
+train_split: synthetic_train
+val_split: synthetic_val
+test_split: synthetic_test
+input_size: 960
+device: 0
+workers: 0
+random_seed: 42
+
+epochs: 100
+batch_size: -1
+patience: 30
+project: runs/scada_yolo11
+name: yolo11s_960
+output_model: best_yolo11s.pt
+
+class_names: [RD, RS, GD, GS, Text]
+text_class_id: 4
+num_symbol_classes: 4
+
+lock_best_checkpoint: lock_classifier_best.pt
+lock_last_checkpoint: lock_classifier_last.pt
+lock_input_size: 96
+lock_crop_padding_ratio: 0.25
+lock_epochs: 50
+lock_batch_size: 128
+lock_learning_rate: 0.001
+lock_backbone_learning_rate: 0.0001
+lock_weight_decay: 0.0001
+lock_patience: 10
+
+nms_iou_threshold: 0.2
+agnostic_nms: false
+max_det: 1000
+candidate_conf_threshold: 0.05
+symbol_conf_threshold: 0.54
+text_conf_threshold: 0.54
+ocr_conf_threshold: 0.75
+lock_threshold: 1
+association_max_distance: 0.03
+symbol_iou_threshold: 0.5
+text_iou_threshold: 0.5
+ocr_crop_padding: 0
+
+rapidocr_use_cuda: true
+rapidocr_device_id: 0
+
+efficiency_warmup_iterations: 10

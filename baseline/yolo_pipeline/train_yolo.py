@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 import yaml
 from ultralytics import YOLO
+from prepare_dataset import prepare_yolo_dataset
 
 
 
@@ -16,6 +17,7 @@ os.chdir(yolo_dir)
 config_path = yolo_dir / "config_yolo.yaml"
 with open(config_path, "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
+prepare_yolo_dataset(yolo_dir, config)
 
 dataset_config = (yolo_dir / config["dataset_config"]).resolve()
 pretrained_model = config["pretrained_model"]
@@ -28,6 +30,7 @@ device = config["device"]
 epochs = config["epochs"]
 batch_size = config["batch_size"]
 workers = config["workers"]
+random_seed = config["random_seed"]
 patience = config["patience"]
 project_dir = (yolo_dir / config["project"]).resolve()
 name = config["name"]
@@ -44,6 +47,8 @@ detector.train(
     batch=batch_size,
     device=device,
     workers=workers,
+    seed=random_seed,
+    deterministic=False,
     patience=patience,
     project=str(project_dir),
     name=name,
