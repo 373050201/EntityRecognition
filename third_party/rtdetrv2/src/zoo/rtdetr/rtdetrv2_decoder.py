@@ -316,7 +316,8 @@ class TransformerDecoderLayer(nn.Module):
                 memory_mask=None,
                 query_pos_embed=None,
                 text_query_pos_embed=None,
-                num_regular_queries=None):
+                num_regular_queries=None,
+                primary_only=False):
         # self attention
         q = k = self.with_pos_embed(target, query_pos_embed)
 
@@ -338,6 +339,9 @@ class TransformerDecoderLayer(nn.Module):
         target2 = self.forward_ffn(target)
         target = target + self.dropout4(target2)
         target = self.norm3(target)
+
+        if primary_only:
+            return target, None
 
         # `[B, Q_total, C]`：使用图元路径更新后的query在文字参考框附近独立取样。
         text_target = self.text_cross_attn(
@@ -388,21 +392,31 @@ class TransformerDecoder(nn.Module):
                 query_pos_head,
                 text_ref_points_unact,
                 attn_mask=None,
-                memory_mask=None):
+                memory_mask=None,
+                primary_only=False):
         dec_out_bboxes = []
         dec_out_text_bboxes = []
         dec_out_logits = []
         dec_out_features = []
         dec_out_text_features = []
         ref_points_detach = F.sigmoid(ref_points_unact)
-        text_ref_points_detach = F.sigmoid(text_ref_points_unact)
+        text_ref_points_detach = (
+            F.sigmoid(text_ref_points_unact)
+            if not primary_only else None
+        )
 
         output = target
         for i, layer in enumerate(self.layers):
             ref_points_input = ref_points_detach.unsqueeze(2)
-            text_ref_points_input = text_ref_points_detach.unsqueeze(2)
             query_pos_embed = query_pos_head(ref_points_detach)
-            text_query_pos_embed = query_pos_head(text_ref_points_detach)
+            text_ref_points_input = (
+                text_ref_points_detach.unsqueeze(2)
+                if not primary_only else None
+            )
+            text_query_pos_embed = (
+                query_pos_head(text_ref_points_detach)
+                if not primary_only else None
+            )
 
             output, text_output = layer(
                 output,
@@ -414,31 +428,37 @@ class TransformerDecoder(nn.Module):
                 memory_mask,
                 query_pos_embed,
                 text_query_pos_embed,
-                num_regular_queries=self.num_queries)
+                num_regular_queries=self.num_queries,
+                primary_only=primary_only)
             # 实体模型的文字框分支需要各层 query 特征执行逐层迭代回归。
             # 训练和推理阶段都保留，最终检测输出仍使用 eval_idx 对应层。
             dec_out_features.append(output)
-            dec_out_text_features.append(text_output)
+            if not primary_only:
+                dec_out_text_features.append(text_output)
 
             inter_ref_bbox = F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points_detach))
-            inter_text_ref_bbox = F.sigmoid(
-                text_bbox_head[i](text_output)
-                + inverse_sigmoid(text_ref_points_detach))
+            if not primary_only:
+                inter_text_ref_bbox = F.sigmoid(
+                    text_bbox_head[i](text_output)
+                    + inverse_sigmoid(text_ref_points_detach))
 
             if self.training:
                 dec_out_logits.append(score_head[i](output))
                 if i == 0:
                     dec_out_bboxes.append(inter_ref_bbox)
-                    dec_out_text_bboxes.append(inter_text_ref_bbox)
+                    if not primary_only:
+                        dec_out_text_bboxes.append(inter_text_ref_bbox)
                 else:
                     dec_out_bboxes.append(F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points)))
-                    dec_out_text_bboxes.append(F.sigmoid(
-                        text_bbox_head[i](text_output)
-                        + inverse_sigmoid(text_ref_points)))
+                    if not primary_only:
+                        dec_out_text_bboxes.append(F.sigmoid(
+                            text_bbox_head[i](text_output)
+                            + inverse_sigmoid(text_ref_points)))
 
             else:
                 # 验证阶段同样保留各层文字框，使文字辅助损失口径与原实现一致。
-                dec_out_text_bboxes.append(inter_text_ref_bbox)
+                if not primary_only:
+                    dec_out_text_bboxes.append(inter_text_ref_bbox)
                 if i == self.eval_idx:
                     dec_out_logits.append(score_head[i](output))
                     dec_out_bboxes.append(inter_ref_bbox)
@@ -446,15 +466,16 @@ class TransformerDecoder(nn.Module):
 
             ref_points = inter_ref_bbox
             ref_points_detach = inter_ref_bbox.detach()
-            text_ref_points = inter_text_ref_bbox
-            text_ref_points_detach = inter_text_ref_bbox.detach()
+            if not primary_only:
+                text_ref_points = inter_text_ref_bbox
+                text_ref_points_detach = inter_text_ref_bbox.detach()
 
         return (
             torch.stack(dec_out_bboxes),
-            torch.stack(dec_out_text_bboxes),
+            torch.stack(dec_out_text_bboxes) if not primary_only else None,
             torch.stack(dec_out_logits),
             torch.stack(dec_out_features),
-            torch.stack(dec_out_text_features),
+            torch.stack(dec_out_text_features) if not primary_only else None,
         )
 
 
@@ -490,7 +511,8 @@ class RTDETRTransformerv2(nn.Module):
                  text_first_layer_sampling_scale=5.0,
                  text_refine_sampling_scale=0.5,
                  region_interaction_mode='none',
-                 region_interaction_init_scale=1e-3):
+                 region_interaction_init_scale=1e-3,
+                 primary_only=False):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -511,6 +533,7 @@ class RTDETRTransformerv2(nn.Module):
         self.text_reference_offset_scale = text_reference_offset_scale
         self.text_reference_jitter_scale = text_reference_jitter_scale
         self.region_interaction_mode = region_interaction_mode
+        self.primary_only = primary_only
 
         if text_reference_offset_scale <= 0:
             raise ValueError("text_reference_offset_scale must be greater than 0")
@@ -841,9 +864,12 @@ class RTDETRTransformerv2(nn.Module):
 
         # `[B, Q_total, 4]`：先确定性预测文字初始框，再按V1-B规则处理。
         # 训练时仅正式entity query加入中心扰动，验证和推理仍为确定性初始化。
-        init_text_ref_points_unact = self._build_initial_text_reference(
-            init_ref_contents,
-            init_ref_points_unact,
+        init_text_ref_points_unact = (
+            self._build_initial_text_reference(
+                init_ref_contents,
+                init_ref_points_unact,
+            )
+            if not self.primary_only else None
         )
 
         # decoder
@@ -863,36 +889,42 @@ class RTDETRTransformerv2(nn.Module):
             self.dec_score_head,
             self.query_pos_head,
             init_text_ref_points_unact,
-            attn_mask=attn_mask)
+            attn_mask=attn_mask,
+            primary_only=self.primary_only)
 
         if self.training and dn_meta is not None:
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
-            _, out_text_bboxes = torch.split(out_text_bboxes, dn_meta['dn_num_split'], dim=2)
+            if not self.primary_only:
+                _, out_text_bboxes = torch.split(out_text_bboxes, dn_meta['dn_num_split'], dim=2)
             dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
             _, out_query_features = torch.split(
                 out_query_features,
                 dn_meta['dn_num_split'],
                 dim=2,
             )
-            _, out_text_query_features = torch.split(
-                out_text_query_features,
-                dn_meta['dn_num_split'],
-                dim=2,
-            )
+            if not self.primary_only:
+                _, out_text_query_features = torch.split(
+                    out_text_query_features,
+                    dn_meta['dn_num_split'],
+                    dim=2,
+                )
 
         out = {
             'pred_logits': out_logits[-1],
             'pred_boxes': out_bboxes[-1],
-            'pred_text_boxes': out_text_bboxes[-1],
             'query_features': out_query_features[-1],
-            'text_query_features': out_text_query_features[-1],
             'decoder_query_features': out_query_features,
-            'decoder_text_query_features': out_text_query_features,
-            'text_aux_outputs': [
-                {'pred_text_boxes': text_boxes}
-                for text_boxes in out_text_bboxes[:-1]
-            ],
         }
+        if not self.primary_only:
+            out.update({
+                'pred_text_boxes': out_text_bboxes[-1],
+                'text_query_features': out_text_query_features[-1],
+                'decoder_text_query_features': out_text_query_features,
+                'text_aux_outputs': [
+                    {'pred_text_boxes': text_boxes}
+                    for text_boxes in out_text_bboxes[:-1]
+                ],
+            })
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(out_logits[:-1], out_bboxes[:-1])

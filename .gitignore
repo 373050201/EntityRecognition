@@ -2,6 +2,7 @@
 .vscode
 debug
 outputs
+tmp
 *.pt
 *.pth
 !weights/*.pth

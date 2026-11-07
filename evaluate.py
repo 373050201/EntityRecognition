@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 import torch
 import yaml
+from thop import profile
 from torch.utils.data import DataLoader
 from dataset import SCADAEntityDataset
 from loss import build_criterion
@@ -19,8 +20,10 @@ from utils import (
 
 # 在这里修改评估选项
 checkpoint_name = "best.pt"
-evaluation_split = "synthetic_val"
+evaluation_split = "synthetic_test"
 use_gt_text_boxes = False
+efficiency_batch_size = 1
+efficiency_warmup_iterations = 10
 
 
 def print_results(
@@ -28,25 +31,22 @@ def print_results(
     component_losses,
     entity_metrics,
     entity_breakdown,
+    efficiency_metrics,
 ):
-    """以紧凑表格输出损失、严格实体指标和各子任务通过率。"""
-    print("评估集损失 | 图元框 | 文字框 | 图元分类 | 锁分类 | CTC | 总损失")
+    """以紧凑表格输出精度、损失和推理效率指标。"""
+    print("实体指标   | F1 | Precision | Recall | 严格准确率")
     print(
         "           | "
-        f"{component_losses['symbol_box']:.4f} | "
-        f"{component_losses['text_box']:.4f} | "
-        f"{component_losses['class']:.4f} | "
-        f"{component_losses['locked']:.4f} | "
-        f"{component_losses['ctc']:.4f} | "
-        f"{average_loss:.4f}"
-    )
-    print("实体指标   | 准确率 | 精确率 | 召回率 | F1")
-    print(
-        "           | "
-        f"{entity_metrics['entity_accuracy']:.4f} | "
+        f"{entity_metrics['entity_f1']:.4f} | "
         f"{entity_metrics['entity_precision']:.4f} | "
         f"{entity_metrics['entity_recall']:.4f} | "
-        f"{entity_metrics['entity_f1']:.4f}"
+        f"{entity_metrics['entity_accuracy']:.4f}"
+    )
+    print(
+        "实体计数   | "
+        f"TP {entity_metrics['true_positive']} | "
+        f"FP {entity_metrics['false_positive']} | "
+        f"FN {entity_metrics['false_negative']}"
     )
     print("拆解指标   | 图IoU | 图框 | 文IoU | 文框 | 图类 | 锁 | 字符 | 编号")
     print(
@@ -60,6 +60,82 @@ def print_results(
         f"{entity_breakdown['identifier_character_accuracy']:.4f} | "
         f"{entity_breakdown['identifier_exact_accuracy']:.4f}"
     )
+    print("效率指标   | FPS | GFLOPs/图 | 峰值显存(GiB)")
+    print(
+        "           | "
+        f"{efficiency_metrics['fps']:.2f} | "
+        f"{efficiency_metrics['gflops_per_image']:.2f} | "
+        f"{efficiency_metrics['peak_memory_gib']:.3f}"
+    )
+    print("评估集损失 | 图元框 | 文字框 | 图元分类 | 锁分类 | CTC | 总损失")
+    print(
+        "           | "
+        f"{component_losses['symbol_box']:.4f} | "
+        f"{component_losses['text_box']:.4f} | "
+        f"{component_losses['class']:.4f} | "
+        f"{component_losses['locked']:.4f} | "
+        f"{component_losses['ctc']:.4f} | "
+        f"{average_loss:.4f}"
+    )
+
+
+def measure_inference_efficiency(
+    model,
+    data_loader,
+    device,
+    warmup_iterations,
+):
+    """按单纯模型前向口径统计FPS、FLOPs和峰值显存。"""
+    first_images, _ = next(iter(data_loader))
+    first_images = first_images.to(
+        device,
+        non_blocking=device.type == "cuda",
+    )
+
+    macs, _ = profile(
+        model,
+        inputs=(first_images[:1],),
+        verbose=False,
+    )
+    gflops_per_image = 2 * macs / 1e9
+
+    print(f"预热模型前向：{warmup_iterations}次")
+    with torch.inference_mode():
+        for _ in range(warmup_iterations):
+            model(first_images)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+
+    num_images = 0
+    inference_seconds = 0.0
+    with torch.inference_mode():
+        for images, _ in data_loader:
+            images = images.to(
+                device,
+                non_blocking=device.type == "cuda",
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            batch_start_time = time.perf_counter()
+            outputs = model(images)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            inference_seconds += time.perf_counter() - batch_start_time
+            num_images += len(images)
+            del outputs
+
+    peak_memory_gib = (
+        torch.cuda.max_memory_allocated(device) / 1024 ** 3
+        if device.type == "cuda"
+        else 0.0
+    )
+    return {
+        "fps": num_images / inference_seconds,
+        "gflops_per_image": gflops_per_image,
+        "peak_memory_gib": peak_memory_gib,
+    }
 
 
 project_root = Path(__file__).resolve().parent
@@ -90,6 +166,14 @@ dataset = SCADAEntityDataset(
 data_loader = DataLoader(
     dataset,
     batch_size=config["batch_size"],
+    shuffle=False,
+    num_workers=config["workers"],
+    pin_memory=device.type == "cuda",
+    collate_fn=entity_collate_fn,
+)
+efficiency_data_loader = DataLoader(
+    dataset,
+    batch_size=efficiency_batch_size,
     shuffle=False,
     num_workers=config["workers"],
     pin_memory=device.type == "cuda",
@@ -136,6 +220,13 @@ ocr_box_mode = "真实文字框" if use_gt_text_boxes else "预测文字框"
 print(f"OCR裁剪模式：{ocr_box_mode}")
 
 model.eval()
+print("开始统计推理效率...")
+efficiency_metrics = measure_inference_efficiency(
+    model,
+    efficiency_data_loader,
+    device,
+    efficiency_warmup_iterations,
+)
 loss_sum = 0.0
 component_loss_sums = {
     "symbol_box": 0.0,
@@ -220,5 +311,6 @@ print_results(
     component_losses,
     entity_metrics,
     entity_breakdown,
+    efficiency_metrics,
 )
 print(f"评估用时：{time.time() - start_time:.2f}s")
