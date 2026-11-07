@@ -17,7 +17,7 @@ ocr_guidance_num_heads: 4
 # V2-A为none；V2-B为dynamic；V2-C为text_only，固定在g=0端点。
 ocr_guidance_gate_mode: text_only
 
-dataset_root: dataset
+dataset_root: datasets/synthetic
 train_split: synthetic_train
 val_split: synthetic_val
 image_size: [540, 960]

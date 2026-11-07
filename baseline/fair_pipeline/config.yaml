@@ -5,7 +5,7 @@ num_text_classes: 1
 num_queries: 100
 ocr_sequence_length: 24
 
-dataset_root: ../../dataset
+dataset_root: ../../datasets/synthetic
 train_split: synthetic_train
 val_split: synthetic_val
 test_split: synthetic_test

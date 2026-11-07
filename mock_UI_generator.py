@@ -14,7 +14,7 @@ from PyQt5.QtGui import QPainter, QColor, QFont, QPainterPath, QPen, QFontMetric
 
 # ---------- 自动保存的相关配置 ----------
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-SAVE_DIR = os.path.join(PROJECT_ROOT, "dataset")
+SAVE_DIR = os.path.join(PROJECT_ROOT, "datasets", "synthetic")
 COUNTER_FILE = os.path.join(PROJECT_ROOT, "counter.txt")
 CLASSES = ["RD", "RS", "GD", "GS"]
 DATASET_RANDOM_SEED = 2026

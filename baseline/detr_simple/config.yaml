@@ -1,4 +1,4 @@
-dataset_root: dataset
+dataset_root: datasets/synthetic
 train_split: synthetic_train
 val_split: synthetic_val
 image_size: [540, 960]

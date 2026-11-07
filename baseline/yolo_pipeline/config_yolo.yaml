@@ -1,4 +1,4 @@
-dataset_root: ../../dataset
+dataset_root: ../../datasets/synthetic
 dataset_config: data_yolo.yaml
 model_path: best_yolo11s.pt
 pretrained_model: yolo11s.pt
