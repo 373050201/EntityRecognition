@@ -1,0 +1,4 @@
+faster-coco-eval>=1.6.6
+calflops>=0.3.2
+loguru>=0.7.3
+

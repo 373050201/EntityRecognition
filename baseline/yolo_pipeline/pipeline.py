@@ -1,5 +1,6 @@
 """YOLO11s检测、RapidOCR识别和匈牙利实体关联流水线。"""
 import math
+import time
 import numpy as np
 import torch
 from rapidocr import RapidOCR
@@ -208,11 +209,24 @@ class YOLOOCRPipeline:
             return "", 0.0
         return str(result.txts[0]).strip(), float(result.scores[0])
 
+    def _synchronize_timing(self):
+        """同步CUDA任务，确保分阶段计时覆盖实际执行时间。"""
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.lock_device)
+
     @torch.inference_mode()
-    def predict_candidates(self, image, detector_confidence=None):
+    def predict_candidates(
+        self,
+        image,
+        detector_confidence=None,
+        stage_timings=None,
+    ):
         """执行一次YOLO检测，并对所有Text候选执行RapidOCR。"""
         if detector_confidence is None:
             detector_confidence = self.config["candidate_conf_threshold"]
+        if stage_timings is not None:
+            self._synchronize_timing()
+            stage_start_time = time.perf_counter()
         results = self.detector.predict(
             source=image,
             conf=detector_confidence,
@@ -226,6 +240,13 @@ class YOLOOCRPipeline:
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
             self.last_num_symbol_candidates = 0
+            if stage_timings is not None:
+                self._synchronize_timing()
+                stage_timings["yolo"] = (
+                    time.perf_counter() - stage_start_time
+                )
+                stage_timings["lock_classifier"] = 0.0
+                stage_timings["rapidocr"] = 0.0
             return _empty_candidates()
 
         image_width, image_height = image.size
@@ -239,6 +260,10 @@ class YOLOOCRPipeline:
         normalized_boxes = (xyxy / scale).clamp(0, 1)
         text_mask = classes == self.config["text_class_id"]
         symbol_mask = ~text_mask
+        if stage_timings is not None:
+            self._synchronize_timing()
+            stage_timings["yolo"] = time.perf_counter() - stage_start_time
+            stage_start_time = time.perf_counter()
         lock_scores = predict_lock_scores(
             self.lock_classifier,
             image,
@@ -248,12 +273,23 @@ class YOLOOCRPipeline:
             self.lock_device,
         )
         self.last_num_symbol_candidates = int(symbol_mask.sum())
+        if stage_timings is not None:
+            self._synchronize_timing()
+            stage_timings["lock_classifier"] = (
+                time.perf_counter() - stage_start_time
+            )
+            stage_start_time = time.perf_counter()
         identifiers = []
         ocr_scores = []
         for box in xyxy[text_mask].tolist():
             identifier, ocr_score = self._recognize_crop(image, box)
             identifiers.append(identifier)
             ocr_scores.append(ocr_score)
+        if stage_timings is not None:
+            self._synchronize_timing()
+            stage_timings["rapidocr"] = (
+                time.perf_counter() - stage_start_time
+            )
         return {
             "symbol_boxes": normalized_boxes[symbol_mask],
             "symbol_scores": scores[symbol_mask],
@@ -265,14 +301,21 @@ class YOLOOCRPipeline:
             "ocr_scores": torch.tensor(ocr_scores, dtype=torch.float32),
         }
 
-    def predict(self, image):
+    def predict(self, image, stage_timings=None):
         """执行工业流水线完整推理并返回组装后的实体。"""
         detector_confidence = min(
             self.config["symbol_conf_threshold"],
             self.config["text_conf_threshold"],
         )
-        candidates = self.predict_candidates(image, detector_confidence)
-        return associate_candidates(
+        candidates = self.predict_candidates(
+            image,
+            detector_confidence,
+            stage_timings=stage_timings,
+        )
+        if stage_timings is not None:
+            self._synchronize_timing()
+            stage_start_time = time.perf_counter()
+        prediction = associate_candidates(
             candidates,
             symbol_conf_threshold=self.config["symbol_conf_threshold"],
             text_conf_threshold=self.config["text_conf_threshold"],
@@ -280,3 +323,9 @@ class YOLOOCRPipeline:
             lock_threshold=self.config["lock_threshold"],
             max_distance=self.config["association_max_distance"],
         )
+        if stage_timings is not None:
+            self._synchronize_timing()
+            stage_timings["association"] = (
+                time.perf_counter() - stage_start_time
+            )
+        return prediction

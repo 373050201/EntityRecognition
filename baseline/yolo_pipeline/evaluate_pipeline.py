@@ -16,7 +16,7 @@ from utils import (
 
 
 def measure_pipeline_efficiency(pipeline, dataset, config):
-    """统计YOLO11s、RapidOCR和匈牙利关联的端到端效率。"""
+    """统计完整流水线端到端效率，并单独执行分阶段耗时剖析。"""
     first_image, _ = dataset[0]
     warmup_iterations = config["efficiency_warmup_iterations"]
     print(f"预热完整工业流水线：{warmup_iterations}次")
@@ -44,6 +44,22 @@ def measure_pipeline_efficiency(pipeline, dataset, config):
         if torch.cuda.is_available()
         else 0.0
     )
+
+    stage_seconds = {
+        "yolo": 0.0,
+        "lock_classifier": 0.0,
+        "rapidocr": 0.0,
+        "association": 0.0,
+    }
+    print("开始分阶段计时：逐阶段同步执行一次测试集")
+    for index in range(len(dataset)):
+        image, _ = dataset[index]
+        image_stage_timings = {}
+        pipeline.predict(image, stage_timings=image_stage_timings)
+        for name in stage_seconds:
+            stage_seconds[name] += image_stage_timings[name]
+    stage_total_seconds = sum(stage_seconds.values())
+
     detector_gflops = get_flops(
         pipeline.detector.model,
         imgsz=config["input_size"],
@@ -62,6 +78,15 @@ def measure_pipeline_efficiency(pipeline, dataset, config):
         "lock_gflops_per_crop": lock_gflops_per_crop,
         "average_lock_crops": average_lock_crops,
         "pytorch_peak_memory_gib": peak_memory_gib,
+        "stage_total_fps": len(dataset) / stage_total_seconds,
+        "stage_milliseconds_per_image": {
+            name: seconds / len(dataset) * 1000
+            for name, seconds in stage_seconds.items()
+        },
+        "stage_percentages": {
+            name: seconds / stage_total_seconds * 100
+            for name, seconds in stage_seconds.items()
+        },
     }
 
 
@@ -155,10 +180,31 @@ print(
     f"YOLO11s {efficiency_metrics['detector_gflops_per_image']:.2f} GFLOPs/图 | "
     f"锁分类器 {efficiency_metrics['lock_gflops_per_crop']:.4f} GFLOPs/裁剪"
 )
+print("阶段耗时   | YOLO11s | 锁分类器 | RapidOCR | 匹配与组装")
+print(
+    "毫秒/图    | "
+    f"{efficiency_metrics['stage_milliseconds_per_image']['yolo']:.2f} | "
+    f"{efficiency_metrics['stage_milliseconds_per_image']['lock_classifier']:.2f} | "
+    f"{efficiency_metrics['stage_milliseconds_per_image']['rapidocr']:.2f} | "
+    f"{efficiency_metrics['stage_milliseconds_per_image']['association']:.2f}"
+)
+print(
+    "耗时占比   | "
+    f"{efficiency_metrics['stage_percentages']['yolo']:.2f}% | "
+    f"{efficiency_metrics['stage_percentages']['lock_classifier']:.2f}% | "
+    f"{efficiency_metrics['stage_percentages']['rapidocr']:.2f}% | "
+    f"{efficiency_metrics['stage_percentages']['association']:.2f}%"
+)
 print(
     "说明：FPS包含YOLO11s、图元裁剪、锁状态分类、文字裁剪、"
     "RapidOCR和匈牙利匹配；估算FLOPs为YOLO11s加平均图元候选数乘以"
     f"单次锁分类FLOPs（平均{efficiency_metrics['average_lock_crops']:.2f}次/图），"
     "不包含RapidOCR的ONNX运算；"
     "峰值显存仅统计PyTorch分配，不包含ONNX Runtime的RapidOCR显存。"
+)
+print(
+    "分阶段计时说明：为保证GPU与ONNX异步任务归入正确阶段，各阶段边界均执行"
+    "CUDA同步，因此分阶段耗时总和对应的"
+    f"{efficiency_metrics['stage_total_fps']:.2f} FPS仅用于瓶颈分析，"
+    "不替代上方无分段同步的端到端FPS。"
 )
