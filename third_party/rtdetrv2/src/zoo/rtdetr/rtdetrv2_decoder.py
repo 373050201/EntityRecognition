@@ -171,7 +171,10 @@ class TransformerDecoderLayer(nn.Module):
                  n_points=4,
                  cross_attn_method='default',
                  region_interaction_mode='none',
-                 region_interaction_init_scale=1e-3):
+                 region_interaction_init_scale=1e-3,
+                 text_slot_interaction_mode='none',
+                 text_slot_interaction_num_heads=4,
+                 text_slot_interaction_init_scale=1e-3):
         super(TransformerDecoderLayer, self).__init__()
 
         # self attention
@@ -205,9 +208,34 @@ class TransformerDecoderLayer(nn.Module):
                 batch_first=True,
             )
             self.region_interaction_dropout = nn.Dropout(dropout)
-            # `[1, 2, 1]`分别控制图元token和文字token的融合强度，小值起步保护原生路径。
+            # 所有同实体区域共享小融合尺度，保护原生路径。
             self.region_interaction_scale = nn.Parameter(
-                torch.full((1, 2, 1), region_interaction_init_scale)
+                torch.full((1, 1, 1), region_interaction_init_scale)
+            )
+
+        # P&ID实验二：只在同一实体的文字私有槽位之间进行自注意力。
+        valid_text_slot_interaction_modes = {'none', 'self_attention'}
+        if text_slot_interaction_mode not in valid_text_slot_interaction_modes:
+            raise ValueError(
+                "Unsupported text_slot_interaction_mode: "
+                f"{text_slot_interaction_mode}"
+            )
+        if d_model % text_slot_interaction_num_heads != 0:
+            raise ValueError(
+                "d_model must be divisible by text_slot_interaction_num_heads"
+            )
+        self.text_slot_interaction_mode = text_slot_interaction_mode
+        if text_slot_interaction_mode != 'none':
+            self.text_slot_interaction_norm = nn.LayerNorm(d_model)
+            self.text_slot_interaction_attn = nn.MultiheadAttention(
+                d_model,
+                text_slot_interaction_num_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.text_slot_interaction_dropout = nn.Dropout(dropout)
+            self.text_slot_interaction_scale = nn.Parameter(
+                torch.full((1, 1, 1), text_slot_interaction_init_scale)
             )
 
         # ffn
@@ -235,6 +263,7 @@ class TransformerDecoderLayer(nn.Module):
         target,
         text_target,
         num_regular_queries,
+        num_text_slots,
     ):
         """只在正式entity query内部交互图元、文字区域特征。"""
         if self.region_interaction_mode == 'none':
@@ -244,17 +273,24 @@ class TransformerDecoderLayer(nn.Module):
 
         # 去噪query位于前部且没有文字监督；只取末尾正式query参与区域交互。
         regular_target = target[:, -num_regular_queries:]
+        batch_size, total_queries, hidden_dim = target.shape
+        text_target = text_target.reshape(
+            batch_size,
+            total_queries,
+            num_text_slots,
+            hidden_dim,
+        )
         regular_text_target = text_target[:, -num_regular_queries:]
 
-        # `[B, Q, 2, C] -> [B*Q, 2, C]`：每组注意力只包含同一实体的两个区域。
-        region_tokens = torch.stack(
-            [regular_target, regular_text_target],
+        # 每组注意力只包含同一实体的图元与文字槽位；实验一配置为none，不执行该分支。
+        region_tokens = torch.cat(
+            [regular_target.unsqueeze(2), regular_text_target],
             dim=2,
         )
-        batch_size, query_count, _, hidden_dim = region_tokens.shape
+        _, query_count, token_count, _ = region_tokens.shape
         region_tokens = region_tokens.reshape(
             batch_size * query_count,
-            2,
+            token_count,
             hidden_dim,
         )
         normalized_tokens = self.region_interaction_norm(region_tokens)
@@ -271,15 +307,15 @@ class TransformerDecoderLayer(nn.Module):
             )
         else:
             # V1-D：文字token在自身和所属图元之间选择信息，只更新文字分支。
-            text_query = normalized_tokens[:, 1:2]
+            text_query = normalized_tokens[:, 1:]
             text_interaction, _ = self.region_interaction_attn(
                 text_query,
                 normalized_tokens,
                 normalized_tokens,
                 need_weights=False,
             )
-            fused_text_token = region_tokens[:, 1:2] + (
-                self.region_interaction_scale[:, 1:2]
+            fused_text_token = region_tokens[:, 1:] + (
+                self.region_interaction_scale
                 * self.region_interaction_dropout(text_interaction)
             )
             region_tokens = torch.cat(
@@ -289,11 +325,11 @@ class TransformerDecoderLayer(nn.Module):
         region_tokens = region_tokens.reshape(
             batch_size,
             query_count,
-            2,
+            token_count,
             hidden_dim,
         )
         fused_target = region_tokens[:, :, 0]
-        fused_text_target = region_tokens[:, :, 1]
+        fused_text_target = region_tokens[:, :, 1:]
 
         # 保留前部去噪query原值，避免无文字监督的特征反向污染图元去噪训练。
         target = torch.cat(
@@ -303,11 +339,65 @@ class TransformerDecoderLayer(nn.Module):
         text_target = torch.cat(
             [text_target[:, :-num_regular_queries], fused_text_target],
             dim=1,
-        )
+        ).reshape(batch_size, total_queries * num_text_slots, hidden_dim)
         return target, text_target
+
+    def _interact_text_slots(
+        self,
+        text_target,
+        batch_size,
+        total_queries,
+        num_regular_queries,
+        num_text_slots,
+    ):
+        """只在同一正式entity query的文字私有槽位之间进行自注意力。"""
+        if self.text_slot_interaction_mode == 'none':
+            return text_target
+        if num_regular_queries <= 0 or num_regular_queries > total_queries:
+            raise ValueError("num_regular_queries is inconsistent with query shape")
+
+        text_target = text_target.reshape(
+            batch_size,
+            total_queries,
+            num_text_slots,
+            -1,
+        )
+        regular_text_target = text_target[:, -num_regular_queries:]
+        regular_text_target = regular_text_target.reshape(
+            batch_size * num_regular_queries,
+            num_text_slots,
+            -1,
+        )
+        normalized_text_target = self.text_slot_interaction_norm(
+            regular_text_target
+        )
+        interaction, _ = self.text_slot_interaction_attn(
+            normalized_text_target,
+            normalized_text_target,
+            normalized_text_target,
+            need_weights=False,
+        )
+        regular_text_target = regular_text_target + (
+            self.text_slot_interaction_scale
+            * self.text_slot_interaction_dropout(interaction)
+        )
+        regular_text_target = regular_text_target.reshape(
+            batch_size,
+            num_regular_queries,
+            num_text_slots,
+            -1,
+        )
+
+        # 前部去噪query没有文字监督，保留其独立采样特征不参与槽位交互。
+        text_target = torch.cat(
+            [text_target[:, :-num_regular_queries], regular_text_target],
+            dim=1,
+        )
+        return text_target.reshape(batch_size, total_queries * num_text_slots, -1)
 
     def forward(self,
                 target,
+                text_source_target,
                 reference_points,
                 text_reference_points,
                 memory,
@@ -317,6 +407,7 @@ class TransformerDecoderLayer(nn.Module):
                 query_pos_embed=None,
                 text_query_pos_embed=None,
                 num_regular_queries=None,
+                num_text_slots=1,
                 primary_only=False):
         # self attention
         q = k = self.with_pos_embed(target, query_pos_embed)
@@ -345,21 +436,29 @@ class TransformerDecoderLayer(nn.Module):
 
         # `[B, Q_total, C]`：使用图元路径更新后的query在文字参考框附近独立取样。
         text_target = self.text_cross_attn(
-            self.with_pos_embed(target, text_query_pos_embed),
+            self.with_pos_embed(text_source_target, text_query_pos_embed),
             text_reference_points,
             memory,
             memory_spatial_shapes,
             memory_mask)
-        text_target = target + self.text_dropout(text_target)
+        text_target = text_source_target + self.text_dropout(text_target)
         text_target = self.text_norm(text_target)
 
         # 按配置在同一正式entity query内交互图元、文字区域特征。
         if num_regular_queries is None:
             num_regular_queries = target.shape[1]
+        text_target = self._interact_text_slots(
+            text_target,
+            target.shape[0],
+            target.shape[1],
+            num_regular_queries,
+            num_text_slots,
+        )
         target, text_target = self._interact_entity_regions(
             target,
             text_target,
             num_regular_queries,
+            num_text_slots,
         )
 
         return target, text_target
@@ -391,6 +490,7 @@ class TransformerDecoder(nn.Module):
                 score_head,
                 query_pos_head,
                 text_ref_points_unact,
+                text_slot_embed,
                 attn_mask=None,
                 memory_mask=None,
                 primary_only=False):
@@ -410,16 +510,20 @@ class TransformerDecoder(nn.Module):
             ref_points_input = ref_points_detach.unsqueeze(2)
             query_pos_embed = query_pos_head(ref_points_detach)
             text_ref_points_input = (
-                text_ref_points_detach.unsqueeze(2)
+                text_ref_points_detach.flatten(1, 2).unsqueeze(2)
                 if not primary_only else None
             )
             text_query_pos_embed = (
-                query_pos_head(text_ref_points_detach)
+                query_pos_head(text_ref_points_detach).flatten(1, 2)
                 if not primary_only else None
             )
+            text_slot_target = (
+                output.unsqueeze(2) + text_slot_embed.view(1, 1, -1, self.hidden_dim)
+            ).flatten(1, 2) if not primary_only else None
 
             output, text_output = layer(
                 output,
+                text_slot_target,
                 ref_points_input,
                 text_ref_points_input,
                 memory,
@@ -429,11 +533,18 @@ class TransformerDecoder(nn.Module):
                 query_pos_embed,
                 text_query_pos_embed,
                 num_regular_queries=self.num_queries,
+                num_text_slots=text_slot_embed.shape[0] if not primary_only else 1,
                 primary_only=primary_only)
             # 实体模型的文字框分支需要各层 query 特征执行逐层迭代回归。
             # 训练和推理阶段都保留，最终检测输出仍使用 eval_idx 对应层。
             dec_out_features.append(output)
             if not primary_only:
+                text_output = text_output.reshape(
+                    output.shape[0],
+                    output.shape[1],
+                    text_slot_embed.shape[0],
+                    self.hidden_dim,
+                )
                 dec_out_text_features.append(text_output)
 
             inter_ref_bbox = F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points_detach))
@@ -506,12 +617,16 @@ class RTDETRTransformerv2(nn.Module):
                  aux_loss=True, 
                  cross_attn_method='default', 
                  query_select_method='default',
-                 text_reference_offset_scale=5.0,
+                 text_reference_offset_scale=2.0,
                  text_reference_jitter_scale=0.2,
-                 text_first_layer_sampling_scale=5.0,
+                 text_first_layer_sampling_scale=2.0,
                  text_refine_sampling_scale=0.5,
                  region_interaction_mode='none',
                  region_interaction_init_scale=1e-3,
+                 text_slot_interaction_mode='none',
+                 text_slot_interaction_num_heads=4,
+                 text_slot_interaction_init_scale=1e-3,
+                 num_text_slots=3,
                  primary_only=False):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -533,6 +648,8 @@ class RTDETRTransformerv2(nn.Module):
         self.text_reference_offset_scale = text_reference_offset_scale
         self.text_reference_jitter_scale = text_reference_jitter_scale
         self.region_interaction_mode = region_interaction_mode
+        self.text_slot_interaction_mode = text_slot_interaction_mode
+        self.num_text_slots = num_text_slots
         self.primary_only = primary_only
 
         if text_reference_offset_scale <= 0:
@@ -545,9 +662,20 @@ class RTDETRTransformerv2(nn.Module):
             raise ValueError("text_refine_sampling_scale must be greater than 0")
         if region_interaction_init_scale < 0:
             raise ValueError("region_interaction_init_scale must be non-negative")
+        if text_slot_interaction_init_scale < 0:
+            raise ValueError("text_slot_interaction_init_scale must be non-negative")
+        if text_slot_interaction_num_heads <= 0:
+            raise ValueError("text_slot_interaction_num_heads must be greater than 0")
+        if num_text_slots <= 0:
+            raise ValueError("num_text_slots must be greater than 0")
         if region_interaction_mode not in ('none', 'bidirectional', 'symbol_to_text'):
             raise ValueError(
                 f"Unsupported region_interaction_mode: {region_interaction_mode}"
+            )
+        if text_slot_interaction_mode not in ('none', 'self_attention'):
+            raise ValueError(
+                "Unsupported text_slot_interaction_mode: "
+                f"{text_slot_interaction_mode}"
             )
 
         assert query_select_method in ('default', 'one2many', 'agnostic'), ''
@@ -562,7 +690,10 @@ class RTDETRTransformerv2(nn.Module):
         decoder_layer = TransformerDecoderLayer(hidden_dim, nhead, dim_feedforward, dropout, \
             activation, num_levels, num_points, cross_attn_method=cross_attn_method, \
             region_interaction_mode=region_interaction_mode, \
-            region_interaction_init_scale=region_interaction_init_scale)
+            region_interaction_init_scale=region_interaction_init_scale, \
+            text_slot_interaction_mode=text_slot_interaction_mode, \
+            text_slot_interaction_num_heads=text_slot_interaction_num_heads, \
+            text_slot_interaction_init_scale=text_slot_interaction_init_scale)
         self.decoder = TransformerDecoder(
             hidden_dim,
             decoder_layer,
@@ -590,6 +721,7 @@ class RTDETRTransformerv2(nn.Module):
         if learn_query_content:
             self.tgt_embed = nn.Embedding(num_queries, hidden_dim)
         self.query_pos_head = MLP(4, 2 * hidden_dim, hidden_dim, 2)
+        self.text_slot_embed = nn.Embedding(num_text_slots, hidden_dim)
         # 初始文字框由entity query相对图元参考框确定性预测。
         self.text_ref_point_head = MLP(hidden_dim, hidden_dim, 4, 3)
 
@@ -639,8 +771,9 @@ class RTDETRTransformerv2(nn.Module):
             init.constant_(_reg.layers[-1].weight, 0)
             init.constant_(_reg.layers[-1].bias, 0)
 
-        # 零残差初始化使文字参考框先从图元参考框稳定起步，再由训练学习相对位置。
-        init.constant_(self.text_ref_point_head.layers[-1].weight, 0)
+        # 小残差初始化既保留图元邻域起点，也让不同Slot Embedding产生不同初始框。
+        init.normal_(self.text_slot_embed.weight, std=0.02)
+        init.normal_(self.text_ref_point_head.layers[-1].weight, std=1e-3)
         init.constant_(self.text_ref_point_head.layers[-1].bias, 0)
         for _reg in self.dec_text_bbox_head:
             init.constant_(_reg.layers[-1].weight, 0)
@@ -662,7 +795,14 @@ class RTDETRTransformerv2(nn.Module):
     def _build_initial_text_reference(self, query, symbol_ref_points_unact):
         """预测文字初始框，并在训练时扰动正式entity query的文字中心。"""
         symbol_reference = F.sigmoid(symbol_ref_points_unact)
-        text_residual = self.text_ref_point_head(query)
+        slot_query = query.unsqueeze(2) + self.text_slot_embed.weight.view(
+            1,
+            1,
+            self.num_text_slots,
+            self.hidden_dim,
+        )
+        text_residual = self.text_ref_point_head(slot_query)
+        symbol_reference = symbol_reference.unsqueeze(2)
 
         # 中心偏移限制在图元尺度定义的连续邻域内，不预设上下左右方向。
         symbol_radius = symbol_reference[..., 2:].amax(dim=-1, keepdim=True)
@@ -682,7 +822,7 @@ class RTDETRTransformerv2(nn.Module):
             regular_query_start = text_center.shape[1] - self.num_queries
             regular_query_mask = (
                 query_indices >= regular_query_start
-            ).to(text_center.dtype).view(1, -1, 1)
+            ).to(text_center.dtype).view(1, -1, 1, 1)
             center_jitter = (
                 torch.rand_like(text_center) * 2 - 1
             ) * symbol_radius * self.text_reference_jitter_scale
@@ -889,6 +1029,7 @@ class RTDETRTransformerv2(nn.Module):
             self.dec_score_head,
             self.query_pos_head,
             init_text_ref_points_unact,
+            self.text_slot_embed.weight,
             attn_mask=attn_mask,
             primary_only=self.primary_only)
 

@@ -1,8 +1,8 @@
 """
 基于官方 RT-DETRv2-R18 的实体检测与文字识别模型。
 
-RT-DETRv2 负责图元分类和图元框定位；同一个 query 继续预测文字框、锁状态和编号，
-从而保持“一个 query 对应一个完整实体”的任务定义。
+RT-DETRv2 负责图元分类和图元框定位；同一个 query 继续预测三个可选文字子实体，
+从而保持“一个 query 对应一个完整层次化实体”的任务定义。
 """
 import sys
 from pathlib import Path
@@ -18,7 +18,7 @@ from src.core import YAMLConfig  # noqa: E402
 
 
 class TextRecognitionHead(nn.Module):
-    """从每个 query 对应的文字区域中提取序列特征并预测数字。"""
+    """共享处理每个 entity query 的三个文字区域并预测 P&ID 文字。"""
 
     def __init__(
         self,
@@ -102,8 +102,10 @@ class TextRecognitionHead(nn.Module):
     @staticmethod
     def _build_rois(text_boxes, feature_height, feature_width):
         """将归一化 cxcywh 文字框转换为 RoIAlign 使用的特征图坐标。"""
-        batch_size, num_queries = text_boxes.shape[:2]
-        boxes_xyxy = cxcywh_to_xyxy(text_boxes)
+        if text_boxes.ndim != 4 or text_boxes.shape[-1] != 4:
+            raise ValueError("text_boxes的shape必须为[B, Q, K, 4]")
+        batch_size, num_queries, num_text_slots = text_boxes.shape[:3]
+        boxes_xyxy = cxcywh_to_xyxy(text_boxes).flatten(1, 2)
 
         minimum_width = 1e-3
         minimum_height = 1e-3
@@ -122,34 +124,56 @@ class TextRecognitionHead(nn.Module):
                 y2 * feature_height,
             ),
             dim=-1,
-        ).reshape(batch_size * num_queries, 4)
+        ).reshape(batch_size * num_queries * num_text_slots, 4)
         batch_indices = torch.arange(
             batch_size,
             dtype=feature_boxes.dtype,
             device=feature_boxes.device,
-        ).repeat_interleave(num_queries)
+        ).repeat_interleave(num_queries * num_text_slots)
         return torch.cat((batch_indices[:, None], feature_boxes), dim=1)
 
-    def forward(
+    @staticmethod
+    def _build_selected_rois(
+        text_boxes,
+        batch_indices,
+        feature_height,
+        feature_width,
+    ):
+        """将选中文字框转换为RoIAlign使用的特征图坐标。"""
+        boxes_xyxy = cxcywh_to_xyxy(text_boxes)
+        minimum_width = 1e-3
+        minimum_height = 1e-3
+        x1 = boxes_xyxy[..., 0].clamp(0, 1 - minimum_width)
+        y1 = boxes_xyxy[..., 1].clamp(0, 1 - minimum_height)
+        x2 = boxes_xyxy[..., 2].clamp(minimum_width, 1)
+        y2 = boxes_xyxy[..., 3].clamp(minimum_height, 1)
+        x2 = torch.maximum(x2, x1 + minimum_width)
+        y2 = torch.maximum(y2, y1 + minimum_height)
+        feature_boxes = torch.stack(
+            (
+                x1 * feature_width,
+                y1 * feature_height,
+                x2 * feature_width,
+                y2 * feature_height,
+            ),
+            dim=-1,
+        )
+        return torch.cat(
+            (
+                batch_indices[:, None].to(feature_boxes.dtype),
+                feature_boxes,
+            ),
+            dim=1,
+        )
+
+    def _recognize_regions(
         self,
-        ocr_features,
+        projected_features,
+        rois,
         query_features,
         text_query_features,
-        text_boxes,
     ):
-        """
-        Args:
-            ocr_features: `[B, 128, H8, W8]` 的高分辨率图像特征。
-            query_features: `[B, Q, 256]` 的 RT-DETRv2 query 特征。
-            text_query_features: `[B, Q, 256]` 的文字区域私有特征。
-            text_boxes: `[B, Q, 4]` 的归一化 cxcywh 文字框。
-        Returns:
-            `[B, Q, 24, 11]` 的字符 logits，最后一类为 CTC blank。
-        """
-        batch_size, num_queries = query_features.shape[:2]
-        feature_height, feature_width = ocr_features.shape[-2:]
-        projected_features = self.feature_projection(ocr_features)
-        rois = self._build_rois(text_boxes, feature_height, feature_width)
+        """对已经选定的文字区域执行共享OCR识别。"""
         region_features = roi_align(
             projected_features,
             rois,
@@ -159,14 +183,11 @@ class TextRecognitionHead(nn.Module):
             aligned=True,
         )
         region_sequence = region_features.mean(dim=2).transpose(1, 2)
-        symbol_token = self.query_projection(
-            query_features.reshape(batch_size * num_queries, -1)
-        )[:, None, :]
+        symbol_token = self.query_projection(query_features)[:, None, :]
         if self.guidance_mode == "cross_attention":
             text_token = self.text_query_projection(
-                text_query_features.reshape(batch_size * num_queries, -1)
+                text_query_features
             )[:, None, :]
-            # V2-A固定双token；V2-B动态门控；V2-C固定只使用文字token。
             guidance_memory = self._build_guidance_memory(
                 symbol_token,
                 text_token,
@@ -181,35 +202,134 @@ class TextRecognitionHead(nn.Module):
                 region_sequence + self.guidance_dropout(guidance)
             )
         else:
-            # V1-B对照：保持原始图元query广播相加的数据流。
             fused_sequence = self.fusion_norm(
                 region_sequence + symbol_token
             )
         encoded_sequence, _ = self.sequence_encoder(fused_sequence)
-        character_logits = self.character_head(encoded_sequence)
+        return self.character_head(encoded_sequence)
+
+    def forward_selected(
+        self,
+        ocr_features,
+        query_features,
+        text_query_features,
+        text_boxes,
+        text_matches,
+    ):
+        """训练时只识别参与CTC损失的匹配文字区域。"""
+        device = ocr_features.device
+        batch_indices = []
+        query_indices = []
+        slot_indices = []
+        for batch_index, matches in enumerate(text_matches):
+            num_matches = len(matches["query_indices"])
+            if num_matches == 0:
+                continue
+            batch_indices.append(
+                torch.full(
+                    (num_matches,),
+                    batch_index,
+                    dtype=torch.long,
+                    device=device,
+                )
+            )
+            query_indices.append(matches["query_indices"].to(device))
+            slot_indices.append(matches["slot_indices"].to(device))
+
+        if not batch_indices:
+            return ocr_features.new_empty(
+                (0, self.sequence_length, self.character_head.out_features)
+            )
+
+        batch_indices = torch.cat(batch_indices)
+        query_indices = torch.cat(query_indices)
+        slot_indices = torch.cat(slot_indices)
+        selected_boxes = text_boxes[
+            batch_indices,
+            query_indices,
+            slot_indices,
+        ]
+        feature_height, feature_width = ocr_features.shape[-2:]
+        projected_features = self.feature_projection(ocr_features)
+        rois = self._build_selected_rois(
+            selected_boxes,
+            batch_indices,
+            feature_height,
+            feature_width,
+        )
+        return self._recognize_regions(
+            projected_features,
+            rois,
+            query_features[batch_indices, query_indices],
+            text_query_features[
+                batch_indices,
+                query_indices,
+                slot_indices,
+            ],
+        )
+
+    def forward(
+        self,
+        ocr_features,
+        query_features,
+        text_query_features,
+        text_boxes,
+    ):
+        """
+        Args:
+            ocr_features: `[B, 128, H8, W8]` 的高分辨率图像特征。
+            query_features: `[B, Q, 256]` 的 RT-DETRv2 query 特征。
+            text_query_features: `[B, Q, K, 256]` 的文字槽位私有特征。
+            text_boxes: `[B, Q, K, 4]` 的归一化 cxcywh 文字框。
+        Returns:
+            `[B, Q, K, T, 43]` 的字符 logits，最后一类为 CTC blank。
+        """
+        batch_size, num_queries, num_text_slots = text_boxes.shape[:3]
+        feature_height, feature_width = ocr_features.shape[-2:]
+        projected_features = self.feature_projection(ocr_features)
+        rois = self._build_rois(text_boxes, feature_height, feature_width)
+        character_logits = self._recognize_regions(
+            projected_features,
+            rois,
+            query_features.unsqueeze(2).expand(
+                -1,
+                -1,
+                num_text_slots,
+                -1,
+            ).reshape(batch_size * num_queries * num_text_slots, -1),
+            text_query_features.reshape(
+                batch_size * num_queries * num_text_slots,
+                -1,
+            ),
+        )
         return character_logits.reshape(
             batch_size,
             num_queries,
+            num_text_slots,
             self.sequence_length,
             -1,
         )
 
 
 class EntityRTDETR(nn.Module):
-    """在官方 RT-DETRv2-R18 上增加实体文字框、锁状态和 OCR 分支。"""
+    """在官方 RT-DETRv2-R18 上增加三个文字子实体及共享OCR分支。"""
 
     def __init__(
         self,
         num_classes=4,
         num_queries=100,
+        num_text_slots=3,
         pretrained_weights=None,
         sequence_length=24,
-        text_reference_offset_scale=5.0,
+        text_reference_offset_scale=2.0,
         text_reference_jitter_scale=0.2,
-        text_first_layer_sampling_scale=5.0,
+        text_first_layer_sampling_scale=2.0,
         text_refine_sampling_scale=0.5,
         region_interaction_mode="none",
         region_interaction_init_scale=0.001,
+        text_slot_interaction_mode="none",
+        text_slot_interaction_num_heads=4,
+        text_slot_interaction_init_scale=0.001,
         ocr_guidance_mode="none",
         ocr_guidance_num_heads=4,
         ocr_guidance_gate_mode="none",
@@ -247,6 +367,18 @@ class EntityRTDETR(nn.Module):
         official.yaml_cfg["RTDETRTransformerv2"][
             "region_interaction_init_scale"
         ] = region_interaction_init_scale
+        official.yaml_cfg["RTDETRTransformerv2"][
+            "text_slot_interaction_mode"
+        ] = text_slot_interaction_mode
+        official.yaml_cfg["RTDETRTransformerv2"][
+            "text_slot_interaction_num_heads"
+        ] = text_slot_interaction_num_heads
+        official.yaml_cfg["RTDETRTransformerv2"][
+            "text_slot_interaction_init_scale"
+        ] = text_slot_interaction_init_scale
+        official.yaml_cfg["RTDETRTransformerv2"][
+            "num_text_slots"
+        ] = num_text_slots
         detector = official.model
 
         if pretrained_weights:
@@ -259,9 +391,11 @@ class EntityRTDETR(nn.Module):
         self.decoder = detector.decoder
         self.num_classes = num_classes
         self.num_queries = num_queries
+        self.num_text_slots = num_text_slots
         hidden_dim = self.decoder.hidden_dim
 
-        self.locked_head = nn.Linear(hidden_dim, 1)
+        self.text_presence_head = nn.Linear(hidden_dim, 1)
+        nn.init.constant_(self.text_presence_head.bias, -2.0)
         self.text_recognition_head = TextRecognitionHead(
             feature_channels=self.backbone.out_channels[0],
             query_dim=hidden_dim,
@@ -327,13 +461,15 @@ class EntityRTDETR(nn.Module):
 
         query_features = outputs["query_features"]
         outputs["pred_symbol_boxes"] = outputs["pred_boxes"]
-        # `[B, Q, 4]`：文字框已在RT-DETRv2 decoder内部完成区域采样和逐层回归。
+        # `[B, Q, 3, 4]`：三个文字框分别完成区域采样和逐层回归。
         pred_text_boxes = outputs["pred_text_boxes"]
-        outputs["pred_locked"] = self.locked_head(query_features)
+        outputs["pred_text_presence"] = self.text_presence_head(
+            outputs["text_query_features"]
+        ).squeeze(-1)
         outputs["ocr_features"] = backbone_features[0]
 
         if recognize_text:
-            outputs["pred_identifier_logits"] = self.text_recognition_head(
+            outputs["pred_text_logits"] = self.text_recognition_head(
                 outputs["ocr_features"],
                 query_features,
                 outputs["text_query_features"],
@@ -346,13 +482,17 @@ def build_model(
     pretrained_weights=None,
     num_classes=4,
     num_queries=100,
+    num_text_slots=3,
     sequence_length=24,
-    text_reference_offset_scale=5.0,
+    text_reference_offset_scale=2.0,
     text_reference_jitter_scale=0.2,
-    text_first_layer_sampling_scale=5.0,
+    text_first_layer_sampling_scale=2.0,
     text_refine_sampling_scale=0.5,
     region_interaction_mode="none",
     region_interaction_init_scale=0.001,
+    text_slot_interaction_mode="none",
+    text_slot_interaction_num_heads=4,
+    text_slot_interaction_init_scale=0.001,
     ocr_guidance_mode="none",
     ocr_guidance_num_heads=4,
     ocr_guidance_gate_mode="none",
@@ -361,6 +501,7 @@ def build_model(
     return EntityRTDETR(
         num_classes=num_classes,
         num_queries=num_queries,
+        num_text_slots=num_text_slots,
         pretrained_weights=pretrained_weights,
         sequence_length=sequence_length,
         text_reference_offset_scale=text_reference_offset_scale,
@@ -369,6 +510,9 @@ def build_model(
         text_refine_sampling_scale=text_refine_sampling_scale,
         region_interaction_mode=region_interaction_mode,
         region_interaction_init_scale=region_interaction_init_scale,
+        text_slot_interaction_mode=text_slot_interaction_mode,
+        text_slot_interaction_num_heads=text_slot_interaction_num_heads,
+        text_slot_interaction_init_scale=text_slot_interaction_init_scale,
         ocr_guidance_mode=ocr_guidance_mode,
         ocr_guidance_num_heads=ocr_guidance_num_heads,
         ocr_guidance_gate_mode=ocr_guidance_gate_mode,

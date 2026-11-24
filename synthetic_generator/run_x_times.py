@@ -7,8 +7,9 @@ from pathlib import Path
 
 
 GENERATE_COUNT = 500
-PROJECT_ROOT = Path(__file__).resolve().parent
-SCRIPT_TO_RUN = PROJECT_ROOT / "mock_UI_generator.py"
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+SCRIPT_TO_RUN = SCRIPT_DIR / "mock_UI_generator.py"
 DATASET_DIR = PROJECT_ROOT / "datasets" / "synthetic"
 COUNTER_FILE = PROJECT_ROOT / "counter.txt"
 SPLITS = ("synthetic_train", "synthetic_val", "synthetic_test")

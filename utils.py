@@ -2,6 +2,8 @@
 项目通用工具函数
 """
 import random
+from queue import Queue
+from threading import Thread
 import numpy as np
 import torch
 from scipy.optimize import linear_sum_assignment
@@ -9,7 +11,11 @@ from torchvision.ops import box_iou
 
 
 
-CTC_CHARACTERS = "0123456789"
+CTC_CHARACTERS = ' "()-0123456789ABCDEFGHIJKLMNOPQRSTUVWXZx°'
+CTC_CHARACTER_TO_INDEX = {
+    character: index for index, character in enumerate(CTC_CHARACTERS)
+}
+CTC_CHARACTER_SET = frozenset(CTC_CHARACTERS)
 CTC_BLANK_INDEX = len(CTC_CHARACTERS)
 CTC_NUM_CLASSES = len(CTC_CHARACTERS) + 1
 
@@ -36,6 +42,43 @@ def seed_data_loader_worker(_worker_id):
     worker_seed = torch.initial_seed() % (2 ** 32)
     random.seed(worker_seed)
     np.random.seed(worker_seed)
+
+
+class BackgroundPrefetchLoader:
+    """使用后台线程预取CPU批次，使图片处理与GPU计算重叠。"""
+
+    def __init__(self, data_loader, prefetch_batches=2):
+        if prefetch_batches <= 0:
+            raise ValueError("预取批次数必须大于0")
+        self.data_loader = data_loader
+        self.prefetch_batches = prefetch_batches
+
+    def __len__(self):
+        return len(self.data_loader)
+
+    def __iter__(self):
+        queue = Queue(maxsize=self.prefetch_batches)
+        sentinel = object()
+
+        def load_batches():
+            try:
+                for batch in self.data_loader:
+                    queue.put((batch, None))
+            except BaseException as error:
+                queue.put((None, error))
+            finally:
+                queue.put(sentinel)
+
+        thread = Thread(target=load_batches, daemon=True)
+        thread.start()
+        while True:
+            item = queue.get()
+            if item is sentinel:
+                break
+            batch, error = item
+            if error is not None:
+                raise error
+            yield batch
 
 
 def capture_random_state(data_loader_generator):
@@ -148,16 +191,21 @@ def cxcywh_to_xyxy(boxes):
     )
 
 
-def encode_identifiers(identifiers, device=None):
-    """将数字字符串列表编码为 CTCLoss 使用的一维目标和长度。"""
+def encode_texts(texts, device=None):
+    """将 P&ID 文字列表编码为 CTCLoss 使用的一维目标和长度。"""
     encoded = []
     lengths = []
-    for identifier in identifiers:
-        identifier = str(identifier)
-        if not identifier or any(character not in CTC_CHARACTERS for character in identifier):
-            raise ValueError(f"编号必须是非空纯数字字符串，实际为：{identifier!r}")
-        encoded.extend(int(character) for character in identifier)
-        lengths.append(len(identifier))
+    for text in texts:
+        text = str(text)
+        if not text:
+            raise ValueError("CTC 文字不能为空")
+        unknown_characters = sorted(set(text) - CTC_CHARACTER_SET)
+        if unknown_characters:
+            raise ValueError(
+                f"文字包含字符集之外的字符：{unknown_characters!r}，实际文字为：{text!r}"
+            )
+        encoded.extend(CTC_CHARACTER_TO_INDEX[character] for character in text)
+        lengths.append(len(text))
 
     return (
         torch.tensor(encoded, dtype=torch.long, device=device),
@@ -165,31 +213,37 @@ def encode_identifiers(identifiers, device=None):
     )
 
 
-def ctc_greedy_decode(identifier_logits, blank_index=CTC_BLANK_INDEX):
+def ctc_greedy_decode(text_logits, blank_index=CTC_BLANK_INDEX):
     """
-    将 `[B, Q, T, C]` 的字符 logits 贪心解码为二维编号字符串列表。
+    将 `[B, Q, K, T, C]` 的字符 logits 贪心解码为三维字符串列表。
 
     解码顺序是先合并相邻重复类别，再删除 CTC blank。
     """
-    if identifier_logits.ndim != 4:
-        raise ValueError("identifier_logits 的 shape 必须为 [B, Q, T, C]")
-    if not 0 <= blank_index < identifier_logits.shape[-1]:
+    if text_logits.ndim != 5:
+        raise ValueError("text_logits的shape必须为[B, Q, K, T, C]")
+    if not 0 <= blank_index < text_logits.shape[-1]:
         raise ValueError("blank_index 超出字符类别范围")
 
-    predicted_indices = identifier_logits.argmax(dim=-1).detach().cpu()
+    predicted_indices = text_logits.argmax(dim=-1).detach().cpu()
     decoded_batch = []
     for image_predictions in predicted_indices:
         decoded_queries = []
-        for sequence in image_predictions:
-            previous_index = None
-            characters = []
-            for character_index in sequence.tolist():
-                if character_index != previous_index and character_index != blank_index:
-                    if character_index >= len(CTC_CHARACTERS):
-                        raise ValueError("预测字符索引超出当前数字字符集")
-                    characters.append(CTC_CHARACTERS[character_index])
-                previous_index = character_index
-            decoded_queries.append("".join(characters))
+        for query_predictions in image_predictions:
+            decoded_slots = []
+            for sequence in query_predictions:
+                previous_index = None
+                characters = []
+                for character_index in sequence.tolist():
+                    if (
+                        character_index != previous_index
+                        and character_index != blank_index
+                    ):
+                        if character_index >= len(CTC_CHARACTERS):
+                            raise ValueError("预测字符索引超出当前 P&ID 字符集")
+                        characters.append(CTC_CHARACTERS[character_index])
+                    previous_index = character_index
+                decoded_slots.append("".join(characters))
+            decoded_queries.append(decoded_slots)
         decoded_batch.append(decoded_queries)
     return decoded_batch
 
@@ -236,21 +290,23 @@ def create_entity_breakdown_counts():
     """创建可跨 batch 累加的实体拆解计数器。"""
     return {
         "num_targets": 0,
+        "num_texts": 0,
         "num_characters": 0,
         "symbol_iou_sum": 0.0,
         "text_iou_sum": 0.0,
         "symbol_box_correct": 0,
         "text_box_correct": 0,
+        "text_count_correct": 0,
         "symbol_class_correct": 0,
-        "locked_correct": 0,
-        "identifier_character_correct": 0,
-        "identifier_exact_correct": 0,
+        "text_character_correct": 0,
+        "text_exact_correct": 0,
     }
 
 
 def summarize_entity_breakdown(counts):
     """将验证集累计的子任务计数转换为便于诊断的比例指标。"""
     num_targets = counts["num_targets"]
+    num_texts = counts["num_texts"]
     num_characters = counts["num_characters"]
 
     def entity_rate(name):
@@ -259,15 +315,21 @@ def summarize_entity_breakdown(counts):
     return {
         "symbol_mean_iou": entity_rate("symbol_iou_sum"),
         "symbol_box_accuracy": entity_rate("symbol_box_correct"),
-        "text_mean_iou": entity_rate("text_iou_sum"),
-        "text_box_accuracy": entity_rate("text_box_correct"),
+        "text_mean_iou": (
+            counts["text_iou_sum"] / num_texts if num_texts > 0 else 0.0
+        ),
+        "text_box_accuracy": (
+            counts["text_box_correct"] / num_texts if num_texts > 0 else 0.0
+        ),
+        "text_count_accuracy": entity_rate("text_count_correct"),
         "symbol_class_accuracy": entity_rate("symbol_class_correct"),
-        "locked_accuracy": entity_rate("locked_correct"),
-        "identifier_character_accuracy": (
-            counts["identifier_character_correct"] / num_characters
+        "text_character_accuracy": (
+            counts["text_character_correct"] / num_characters
             if num_characters > 0 else 0.0
         ),
-        "identifier_exact_accuracy": entity_rate("identifier_exact_correct"),
+        "text_exact_accuracy": (
+            counts["text_exact_correct"] / num_texts if num_texts > 0 else 0.0
+        ),
     }
 
 
@@ -296,14 +358,15 @@ def calculate_entity_metrics(
     entity_conf_threshold=0.5,
     symbol_iou_threshold=0.5,
     text_iou_threshold=0.5,
-    lock_threshold=0.5,
+    text_presence_threshold=0.5,
+    decoded_texts=None,
 ):
-    """对使用 sigmoid 分类的 RT-DETRv2 输出执行实体级严格评估。"""
+    """按图元外层匹配和文字内层集合匹配执行严格实体评估。"""
     thresholds = (
         entity_conf_threshold,
         symbol_iou_threshold,
         text_iou_threshold,
-        lock_threshold,
+        text_presence_threshold,
     )
     if any(threshold < 0 or threshold > 1 for threshold in thresholds):
         raise ValueError("实体评估的所有阈值都必须位于[0, 1]")
@@ -312,7 +375,10 @@ def calculate_entity_metrics(
     if len(targets) != batch_size:
         raise ValueError("targets数量必须与batch size一致")
 
-    decoded_identifiers = ctc_greedy_decode(outputs["pred_identifier_logits"])
+    if decoded_texts is None:
+        decoded_texts = ctc_greedy_decode(outputs["pred_text_logits"])
+    if len(decoded_texts) != batch_size:
+        raise ValueError("decoded_texts数量必须与batch size一致")
     true_positive = 0
     false_positive = 0
     false_negative = 0
@@ -329,45 +395,47 @@ def calculate_entity_metrics(
         )[keep]
 
         predicted_labels = foreground_labels[keep]
-        predicted_locked = (
-            outputs["pred_locked"][batch_index, keep].sigmoid().squeeze(-1)
-            >= lock_threshold
+        predicted_presence = (
+            outputs["pred_text_presence"][batch_index, keep].sigmoid()
+            >= text_presence_threshold
         )
         predicted_symbol_boxes = cxcywh_to_xyxy(
             outputs["pred_symbol_boxes"][batch_index, keep]
         ).clamp(0, 1)
-        predicted_text_boxes = cxcywh_to_xyxy(
-            outputs["pred_text_boxes"][batch_index, keep]
-        ).clamp(0, 1)
-        predicted_identifiers = [
-            decoded_identifiers[batch_index][query_index]
+        predicted_text_boxes = outputs["pred_text_boxes"][batch_index, keep]
+        predicted_texts = [
+            decoded_texts[batch_index][query_index]
             for query_index in kept_query_indices.tolist()
         ]
 
         target_labels = targets[batch_index]["labels"].to(predicted_labels.device)
-        target_locked = targets[batch_index]["locked"].to(predicted_labels.device)
         target_symbol_boxes = cxcywh_to_xyxy(
             targets[batch_index]["symbol_boxes"].to(predicted_labels.device)
         ).clamp(0, 1)
-        target_text_boxes = cxcywh_to_xyxy(
-            targets[batch_index]["text_boxes"].to(predicted_labels.device)
-        ).clamp(0, 1)
-        target_identifiers = targets[batch_index]["identifiers"]
+        target_text_boxes = targets[batch_index]["text_boxes"].to(
+            predicted_labels.device
+        )
+        target_text_valid = targets[batch_index]["text_valid"].to(
+            predicted_labels.device
+        )
+        target_text_supervision = targets[batch_index]["text_supervision"].to(
+            predicted_labels.device
+        )
+        target_texts = targets[batch_index]["texts"]
 
         num_predictions = len(predicted_labels)
         num_targets = len(target_labels)
         image_true_positive = 0
-        target_identifier_strings = [
-            str(identifier) for identifier in target_identifiers
-        ]
-        breakdown_counts["num_targets"] += num_targets
-        breakdown_counts["num_characters"] += sum(
-            len(identifier) for identifier in target_identifier_strings
-        )
+        complete_target_count = int(target_text_supervision.sum().item())
+        breakdown_counts["num_targets"] += complete_target_count
+        for target_index in torch.where(target_text_supervision)[0].tolist():
+            for text_index in torch.where(target_text_valid[target_index])[0].tolist():
+                target_text = target_texts[target_index][text_index]
+                breakdown_counts["num_texts"] += 1
+                breakdown_counts["num_characters"] += len(target_text)
 
         if num_predictions > 0 and num_targets > 0:
             symbol_ious = box_iou(predicted_symbol_boxes, target_symbol_boxes)
-            text_ious = box_iou(predicted_text_boxes, target_text_boxes)
             valid_symbol_pairs = symbol_ious >= symbol_iou_threshold
             matching_cost = torch.where(
                 valid_symbol_pairs,
@@ -383,55 +451,103 @@ def calculate_entity_metrics(
                 target_indices,
             ):
                 symbol_iou = symbol_ious[prediction_index, target_index].item()
-                text_iou = text_ious[prediction_index, target_index].item()
+                if not bool(target_text_supervision[target_index]):
+                    # 边界截断实体不参与完整实体指标，匹配到它的预测也不计误检。
+                    continue
                 symbol_box_correct = bool(
                     valid_symbol_pairs[prediction_index, target_index]
                 )
-                text_box_correct = text_iou >= text_iou_threshold
                 symbol_class_correct = bool(
                     predicted_labels[prediction_index]
                     == target_labels[target_index]
                 )
-                locked_correct = bool(
-                    predicted_locked[prediction_index]
-                    == target_locked[target_index].bool()
-                )
-                predicted_identifier = predicted_identifiers[prediction_index]
-                target_identifier = target_identifier_strings[target_index]
-                identifier_exact_correct = (
-                    predicted_identifier == target_identifier
-                )
+
+                active_slots = torch.where(predicted_presence[prediction_index])[0]
+                valid_text_indices = torch.where(target_text_valid[target_index])[0]
+                text_count_correct = len(active_slots) == len(valid_text_indices)
+                all_text_boxes_correct = text_count_correct
+                all_texts_correct = text_count_correct
+                if len(active_slots) > 0 and len(valid_text_indices) > 0:
+                    source_text_boxes = cxcywh_to_xyxy(
+                        predicted_text_boxes[prediction_index, active_slots]
+                    ).clamp(0, 1)
+                    target_boxes = cxcywh_to_xyxy(
+                        target_text_boxes[target_index, valid_text_indices]
+                    ).clamp(0, 1)
+                    text_ious = box_iou(source_text_boxes, target_boxes)
+                    source_indices, local_target_indices = linear_sum_assignment(
+                        (1 - text_ious).cpu().numpy()
+                    )
+                    matched_text_ious = []
+                    for source_index, local_target_index in zip(
+                        source_indices,
+                        local_target_indices,
+                    ):
+                        text_iou = text_ious[
+                            source_index,
+                            local_target_index,
+                        ].item()
+                        matched_text_ious.append(text_iou)
+                        breakdown_counts["text_iou_sum"] += text_iou
+                        text_box_correct = text_iou >= text_iou_threshold
+                        breakdown_counts["text_box_correct"] += text_box_correct
+                        slot_index = int(active_slots[source_index])
+                        text_index = int(valid_text_indices[local_target_index])
+                        predicted_text = predicted_texts[prediction_index][slot_index]
+                        target_text = target_texts[target_index][text_index]
+                        text_exact_correct = predicted_text == target_text
+                        breakdown_counts["text_exact_correct"] += text_exact_correct
+                        text_distance = _levenshtein_distance(
+                            predicted_text,
+                            target_text,
+                        )
+                        breakdown_counts["text_character_correct"] += max(
+                            len(target_text) - text_distance,
+                            0,
+                        )
+                        all_texts_correct = all_texts_correct and text_exact_correct
+                    all_text_boxes_correct = (
+                        all_text_boxes_correct
+                        and len(matched_text_ious) == len(valid_text_indices)
+                        and all(
+                            iou >= text_iou_threshold
+                            for iou in matched_text_ious
+                        )
+                    )
+                elif len(valid_text_indices) > 0:
+                    all_text_boxes_correct = False
+                    all_texts_correct = False
 
                 breakdown_counts["symbol_iou_sum"] += symbol_iou
-                breakdown_counts["text_iou_sum"] += text_iou
                 breakdown_counts["symbol_box_correct"] += symbol_box_correct
-                breakdown_counts["text_box_correct"] += text_box_correct
+                breakdown_counts["text_count_correct"] += text_count_correct
                 breakdown_counts["symbol_class_correct"] += symbol_class_correct
-                breakdown_counts["locked_correct"] += locked_correct
-                breakdown_counts["identifier_exact_correct"] += (
-                    identifier_exact_correct
-                )
-                identifier_distance = _levenshtein_distance(
-                    predicted_identifier,
-                    target_identifier,
-                )
-                breakdown_counts["identifier_character_correct"] += max(
-                    len(target_identifier) - identifier_distance,
-                    0,
-                )
 
                 is_exact_entity = (
                     symbol_box_correct
                     and symbol_class_correct
-                    and locked_correct
-                    and text_box_correct
-                    and identifier_exact_correct
+                    and text_count_correct
+                    and all_text_boxes_correct
+                    and all_texts_correct
                 )
                 if bool(is_exact_entity):
                     image_true_positive += 1
 
-        image_false_positive = num_predictions - image_true_positive
-        image_false_negative = num_targets - image_true_positive
+        # 与截断GT匹配的预测从误检中移除，但截断GT本身也不计漏检。
+        ignored_predictions = 0
+        if num_predictions > 0 and num_targets > 0:
+            ignored_predictions = sum(
+                not bool(target_text_supervision[target_index])
+                for prediction_index, target_index in zip(
+                    prediction_indices,
+                    target_indices,
+                )
+                if bool(valid_symbol_pairs[prediction_index, target_index])
+            )
+        image_false_positive = (
+            num_predictions - ignored_predictions - image_true_positive
+        )
+        image_false_negative = complete_target_count - image_true_positive
         true_positive += image_true_positive
         false_positive += image_false_positive
         false_negative += image_false_negative

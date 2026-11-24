@@ -6,10 +6,11 @@ import yaml
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from dataset import SCADAEntityDataset
+from dataset import PIDEntityDataset
 from loss import build_criterion
 from model import build_model
 from utils import (
+    BackgroundPrefetchLoader,
     calculate_entity_metrics,
     capture_random_state,
     create_entity_breakdown_counts,
@@ -38,6 +39,7 @@ with open(config_path, "r", encoding="utf-8") as file:
 set_random_seed(config["random_seed"])
 print(f"训练随机种子：{config['random_seed']}")
 print(f"区域交互模式：{config['region_interaction_mode']}")
+print(f"文字槽位交互模式：{config['text_slot_interaction_mode']}")
 print(f"OCR指导模式：{config['ocr_guidance_mode']}")
 print(f"OCR指导门控：{config['ocr_guidance_gate_mode']}")
 
@@ -47,21 +49,32 @@ else:
     device = torch.device(config["device"])
 print(f"训练设备：{device}")
 
+amp_enabled = bool(config["amp_enabled"] and device.type == "cuda")
+if device.type == "cuda":
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+print(f"混合精度：{amp_enabled}")
+
 
 print("正在加载训练/验证集...")
 dataset_root = project_root / config["dataset_root"]
 image_size = tuple(config["image_size"])
-train_dataset = SCADAEntityDataset(
+train_dataset = PIDEntityDataset(
     dataset_root,
     split=config["train_split"],
     image_size=image_size,
     normalize=False,
+    num_text_slots=config["num_text_slots"],
+    include_partial_entities=config["include_partial_entities"],
 )
-val_dataset = SCADAEntityDataset(
+val_dataset = PIDEntityDataset(
     dataset_root,
     split=config["val_split"],
     image_size=image_size,
     normalize=False,
+    num_text_slots=config["num_text_slots"],
+    include_partial_entities=config["include_partial_entities"],
 )
 train_loader_generator = torch.Generator()
 train_loader_generator.manual_seed(config["random_seed"])
@@ -87,6 +100,14 @@ val_loader = DataLoader(
     worker_init_fn=seed_data_loader_worker,
     generator=val_loader_generator,
 )
+train_loader = BackgroundPrefetchLoader(
+    train_loader,
+    prefetch_batches=config["prefetch_batches"],
+)
+val_loader = BackgroundPrefetchLoader(
+    val_loader,
+    prefetch_batches=config["prefetch_batches"],
+)
 print(f"训练图片：{len(train_dataset)}，验证图片：{len(val_dataset)}")
 
 
@@ -95,6 +116,7 @@ model = build_model(
     pretrained_weights=project_root / config["pretrained_weights"],
     num_classes=config["num_classes"],
     num_queries=config["num_queries"],
+    num_text_slots=config["num_text_slots"],
     sequence_length=config["ocr_sequence_length"],
     text_reference_offset_scale=config["text_reference_offset_scale"],
     text_reference_jitter_scale=config["text_reference_jitter_scale"],
@@ -104,6 +126,11 @@ model = build_model(
     text_refine_sampling_scale=config["text_refine_sampling_scale"],
     region_interaction_mode=config["region_interaction_mode"],
     region_interaction_init_scale=config["region_interaction_init_scale"],
+    text_slot_interaction_mode=config["text_slot_interaction_mode"],
+    text_slot_interaction_num_heads=config["text_slot_interaction_num_heads"],
+    text_slot_interaction_init_scale=config[
+        "text_slot_interaction_init_scale"
+    ],
     ocr_guidance_mode=config["ocr_guidance_mode"],
     ocr_guidance_num_heads=config["ocr_guidance_num_heads"],
     ocr_guidance_gate_mode=config["ocr_guidance_gate_mode"],
@@ -112,7 +139,9 @@ criterion = build_criterion(
     num_classes=config["num_classes"],
     text_bbox_coef=config["text_bbox_coef"],
     text_giou_coef=config["text_giou_coef"],
-    locked_coef=config["locked_coef"],
+    text_presence_coef=config["text_presence_coef"],
+    text_duplicate_coef=config["text_duplicate_coef"],
+    text_duplicate_iou_threshold=config["text_duplicate_iou_threshold"],
     ctc_coef=config["ctc_weight"],
 ).to(device)
 
@@ -136,7 +165,9 @@ optimizer = AdamW(
         },
     ],
     weight_decay=config["weight_decay"],
+    fused=device.type == "cuda",
 )
+grad_scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
 best_model_path = project_root / "best.pt"
 last_model_path = project_root / "last.pt"
@@ -165,6 +196,10 @@ if resume_checkpoint_name is not None:
 
     model.load_state_dict(resume_checkpoint["model_state_dict"], strict=True)
     optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+    if "grad_scaler_state_dict" in resume_checkpoint:
+        grad_scaler.load_state_dict(
+            resume_checkpoint["grad_scaler_state_dict"]
+        )
     start_epoch = resume_checkpoint["epoch"] + 1
 
     # 新版last.pt会恢复随机序列；旧检查点仍可续训，但不能保证与原运行逐步一致。
@@ -235,43 +270,87 @@ for epoch in range(start_epoch, config["epochs"] + 1):
 
     # 训练阶段
     model.train()
-    train_loss_sum = 0.0
-    for images, targets in train_loader:
+    train_loss_sum = torch.zeros((), device=device)
+    epoch_train_start_time = time.time()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    for batch_index, (images, targets) in enumerate(train_loader, start=1):
         images = images.to(device, non_blocking=device.type == "cuda")
 
-        # 先预测实体并完成匹配，再决定OCR使用真实框还是预测框。
-        outputs = model(images, targets=targets, recognize_text=False)
-        indices = criterion.matcher(outputs, targets)
-        ocr_text_boxes = outputs["pred_text_boxes"]
-        if epoch <= config["ocr_gt_box_epochs"]:
-            ocr_text_boxes = ocr_text_boxes.clone()
-            for batch_index, (query_indices, target_indices) in enumerate(indices):
-                ocr_text_boxes[batch_index, query_indices] = targets[
-                    batch_index
-                ]["text_boxes"].to(device)[target_indices]
+        with torch.amp.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=amp_enabled,
+        ):
+            # 先预测实体并完成匹配，再决定OCR使用真实框还是预测框。
+            outputs = model(images, targets=targets, recognize_text=False)
+            indices = criterion.matcher(outputs, targets)
+            text_matches = criterion.match_text_slots(outputs, targets, indices)
+            ocr_text_boxes = outputs["pred_text_boxes"]
+            if epoch <= config["ocr_gt_box_epochs"]:
+                ocr_text_boxes = ocr_text_boxes.clone()
+                for target_batch_index, matches in enumerate(text_matches):
+                    ocr_text_boxes[
+                        target_batch_index,
+                        matches["query_indices"],
+                        matches["slot_indices"],
+                    ] = targets[target_batch_index]["text_boxes"].to(device)[
+                        matches["target_indices"],
+                        matches["text_indices"],
+                    ]
 
-        outputs["pred_identifier_logits"] = model.text_recognition_head(
-            outputs["ocr_features"],
-            outputs["query_features"],
-            outputs["text_query_features"],
-            ocr_text_boxes,
-        )
-        losses = criterion(outputs, targets, indices=indices)
-        train_loss = losses["loss_total"]
-        if epoch <= config["ctc_warmup_epochs"]:
-            # 初期文字框尚不稳定，暂时不让CTC损失参与反向传播。
-            train_loss = train_loss - (
-                config["ctc_weight"] * losses["loss_identifier_ctc"]
+            # CTC只使用匹配文字，跳过没有梯度贡献的未匹配OCR区域。
+            outputs["matched_text_logits"] = (
+                model.text_recognition_head.forward_selected(
+                    outputs["ocr_features"],
+                    outputs["query_features"],
+                    outputs["text_query_features"],
+                    ocr_text_boxes,
+                    text_matches,
+                )
+            )
+            losses = criterion(
+                outputs,
+                targets,
+                indices=indices,
+                text_matches=text_matches,
+            )
+            train_loss = losses["loss_total"]
+            if epoch <= config["ctc_warmup_epochs"]:
+                # 初期文字框尚不稳定，暂时不让CTC损失参与反向传播。
+                train_loss = train_loss - (
+                    losses["loss_text_ctc"]
+                )
+
+        optimizer.zero_grad(set_to_none=True)
+        grad_scaler.scale(train_loss).backward()
+        grad_scaler.unscale_(optimizer)
+        clip_grad_norm_(model.parameters(), config["max_grad_norm"])
+        grad_scaler.step(optimizer)
+        grad_scaler.update()
+
+        # 保持损失在GPU上累计，避免每个batch调用item导致强制同步。
+        train_loss_sum += train_loss.detach()
+        if batch_index % config["log_interval"] == 0:
+            elapsed_time = time.time() - epoch_train_start_time
+            seconds_per_batch = elapsed_time / batch_index
+            remaining_hours = (
+                (len(train_loader) - batch_index)
+                * seconds_per_batch
+                / 3600
+            )
+            peak_memory_gib = (
+                torch.cuda.max_memory_allocated() / 1024 ** 3
+                if device.type == "cuda" else 0.0
+            )
+            print(
+                f"训练进度：{batch_index}/{len(train_loader)}，"
+                f"{seconds_per_batch:.3f}s/batch，"
+                f"本轮剩余约{remaining_hours:.2f}h，"
+                f"峰值显存{peak_memory_gib:.2f}GiB"
             )
 
-        optimizer.zero_grad()
-        train_loss.backward()
-        clip_grad_norm_(model.parameters(), config["max_grad_norm"])
-        optimizer.step()
-
-        train_loss_sum += train_loss.detach().item()
-
-    average_train_loss = train_loss_sum / len(train_loader)
+    average_train_loss = (train_loss_sum / len(train_loader)).item()
     print(f"训练集损失：{average_train_loss:.4f}")
 
     # 验证阶段始终计算包含CTC在内的完整联合损失。
@@ -280,8 +359,9 @@ for epoch in range(start_epoch, config["epochs"] + 1):
     val_component_loss_sums = {
         "symbol_box": 0.0,
         "text_box": 0.0,
+        "text_presence": 0.0,
+        "text_duplicate": 0.0,
         "class": 0.0,
-        "locked": 0.0,
         "ctc": 0.0,
     }
     entity_counts = {
@@ -294,8 +374,13 @@ for epoch in range(start_epoch, config["epochs"] + 1):
         for images, targets in val_loader:
             images = images.to(device, non_blocking=device.type == "cuda")
 
-            outputs = model(images)
-            losses = criterion(outputs, targets)
+            with torch.amp.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=amp_enabled,
+            ):
+                outputs = model(images)
+                losses = criterion(outputs, targets)
             val_loss_sum += losses["loss_total"].item()
             # 各分支损失乘以训练时的相同权重，因此它们相加等于总损失。
             val_component_loss_sums["symbol_box"] += (
@@ -316,13 +401,17 @@ for epoch in range(start_epoch, config["epochs"] + 1):
                 losses["loss_class"]
                 * criterion.weight_dict["loss_class"]
             ).item()
-            val_component_loss_sums["locked"] += (
-                losses["loss_locked"]
-                * criterion.weight_dict["loss_locked"]
+            val_component_loss_sums["text_presence"] += (
+                losses["loss_text_presence"]
+                * criterion.weight_dict["loss_text_presence"]
+            ).item()
+            val_component_loss_sums["text_duplicate"] += (
+                losses["loss_text_duplicate"]
+                * criterion.weight_dict["loss_text_duplicate"]
             ).item()
             val_component_loss_sums["ctc"] += (
-                losses["loss_identifier_ctc"]
-                * criterion.weight_dict["loss_identifier_ctc"]
+                losses["loss_text_ctc"]
+                * criterion.weight_dict["loss_text_ctc"]
             ).item()
 
             batch_entity_metrics = calculate_entity_metrics(
@@ -331,7 +420,7 @@ for epoch in range(start_epoch, config["epochs"] + 1):
                 entity_conf_threshold=config["entity_conf_threshold"],
                 symbol_iou_threshold=config["symbol_iou_threshold"],
                 text_iou_threshold=config["text_iou_threshold"],
-                lock_threshold=config["lock_threshold"],
+                text_presence_threshold=config["text_presence_threshold"],
             )
             for count_name in entity_counts:
                 entity_counts[count_name] += batch_entity_metrics[count_name]
@@ -347,18 +436,19 @@ for epoch in range(start_epoch, config["epochs"] + 1):
     }
     val_entity_metrics = summarize_entity_metrics(**entity_counts)
     val_entity_breakdown = summarize_entity_breakdown(entity_breakdown_counts)
-    print("验证集损失 | 图元框 | 文字框 | 图元分类 | 锁分类 | CTC | 总损失")
+    print("验证集损失 | 图元框 | 文字框 | 槽位存在 | 重复抑制 | 图元分类 | CTC | 总损失")
     print(
         "           | "
         f"{average_val_component_losses['symbol_box']:.4f} | "
         f"{average_val_component_losses['text_box']:.4f} | "
+        f"{average_val_component_losses['text_presence']:.4f} | "
+        f"{average_val_component_losses['text_duplicate']:.4f} | "
         f"{average_val_component_losses['class']:.4f} | "
-        f"{average_val_component_losses['locked']:.4f} | "
         f"{average_val_component_losses['ctc']:.4f} | "
         f"{average_val_loss:.4f}"
     )
     print(f"验证集实体准确率：{val_entity_metrics['entity_accuracy']:.4f}")
-    print("验证集拆解 | 图IoU | 图框 | 文IoU | 文框 | 图类 | 锁 | 字符 | 编号")
+    print("验证集拆解 | 图IoU | 图框 | 文IoU | 文框 | 图类 | 数量 | 字符 | 文本")
     print(
         "           | "
         f"{val_entity_breakdown['symbol_mean_iou']:.4f} | "
@@ -366,9 +456,9 @@ for epoch in range(start_epoch, config["epochs"] + 1):
         f"{val_entity_breakdown['text_mean_iou']:.4f} | "
         f"{val_entity_breakdown['text_box_accuracy']:.4f} | "
         f"{val_entity_breakdown['symbol_class_accuracy']:.4f} | "
-        f"{val_entity_breakdown['locked_accuracy']:.4f} | "
-        f"{val_entity_breakdown['identifier_character_accuracy']:.4f} | "
-        f"{val_entity_breakdown['identifier_exact_accuracy']:.4f}"
+        f"{val_entity_breakdown['text_count_accuracy']:.4f} | "
+        f"{val_entity_breakdown['text_character_accuracy']:.4f} | "
+        f"{val_entity_breakdown['text_exact_accuracy']:.4f}"
     )
 
     # 首先选择实体准确率最高的模型；准确率相同时选择验证损失更低的模型。
@@ -411,6 +501,7 @@ for epoch in range(start_epoch, config["epochs"] + 1):
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "grad_scaler_state_dict": grad_scaler.state_dict(),
             "val_loss": average_val_loss,
             "val_loss_components": average_val_component_losses,
             "entity_metrics": val_entity_metrics,

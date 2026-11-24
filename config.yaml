@@ -1,33 +1,43 @@
 model_name: rtdetrv2_r18vd
 pretrained_weights: weights/rtdetrv2_r18vd_120e_coco.pth
-num_classes: 4
+num_classes: 32
 num_queries: 100
+num_text_slots: 3
+# 当前标注的最长文字为13字符，最大CTC最短对齐长度为14；24步保留10步余量。
 ocr_sequence_length: 24
 
-text_reference_offset_scale: 5.0
+text_reference_offset_scale: 2.0
 text_reference_jitter_scale: 0.2 # 改为0.0则取消训练时框的随机抖动，即V1-A
-text_first_layer_sampling_scale: 5.0
+text_first_layer_sampling_scale: 2.0
 text_refine_sampling_scale: 0.5
 # V2-A保持none；其他取值bidirectional/symbol_to_text，只用于复现V1-C/V1-D。
 region_interaction_mode: none
 region_interaction_init_scale: 0.001
+text_slot_interaction_mode: self_attention
+text_slot_interaction_num_heads: 4
+text_slot_interaction_init_scale: 0.001
 # 固定为cross_attention：V1-B为none；V2阶段均使用token指导OCR。
 ocr_guidance_mode: cross_attention
 ocr_guidance_num_heads: 4
 # V2-A为none；V2-B为dynamic；V2-C为text_only，固定在g=0端点。
 ocr_guidance_gate_mode: text_only
 
-dataset_root: datasets/synthetic
-train_split: synthetic_train
-val_split: synthetic_val
-image_size: [540, 960]
+dataset_root: datasets/p_id
+train_split: p_id_train
+val_split: p_id_val
+test_split: p_id_test
+image_size: [1024, 1024]
+include_partial_entities: true
 
 device: auto
 # 训练复现种子；需要更换实验种子时只修改这里。
 random_seed: 42
 epochs: 200
-batch_size: 4
+batch_size: 9
 workers: 0
+prefetch_batches: 2
+log_interval: 100
+amp_enabled: true
 
 learning_rate: 0.0001
 backbone_learning_rate: 0.00001
@@ -39,18 +49,21 @@ max_grad_norm: 0.1
 
 text_bbox_coef: 10.0
 text_giou_coef: 4.0
-locked_coef: 1.0
+text_presence_coef: 1.0
+# 仅抑制未匹配槽位复制已匹配文字框；IoU停止梯度，不改变推理结构。
+text_duplicate_coef: 0.5
+text_duplicate_iou_threshold: 0.5
 ctc_weight: 1.0
 
-# 前几轮先让检测和双框稳定，再把CTC损失加入反向传播。
-ctc_warmup_epochs: 5
+# 第一轮先让图元框和三个文字槽位稳定，再把CTC损失加入反向传播。
+ctc_warmup_epochs: 1
 
-# 前50轮让匹配query使用真实文字框训练OCR，此后切换到预测文字框。
-ocr_gt_box_epochs: 50
+# 前5轮让内层匹配槽位使用对应真实文字框训练OCR，此后切换到预测框。
+ocr_gt_box_epochs: 5
 
 entity_conf_threshold: 0.5
 symbol_iou_threshold: 0.5
 text_iou_threshold: 0.5
-lock_threshold: 0.5
+text_presence_threshold: 0.362
 
-patience: 20
+patience: 15
