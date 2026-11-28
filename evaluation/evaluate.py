@@ -75,12 +75,13 @@ def print_results(
         f"{efficiency_metrics['gflops_per_image']:.2f} | "
         f"{efficiency_metrics['peak_memory_gib']:.3f}"
     )
-    print("评估集损失 | 图元框 | 文字框 | 槽位存在 | 图元分类 | CTC | 总损失")
+    print("评估集损失 | 图元框 | 文字框 | 槽位存在 | 基数边界 | 图元分类 | CTC | 总损失")
     print(
         "           | "
         f"{component_losses['symbol_box']:.4f} | "
         f"{component_losses['text_box']:.4f} | "
         f"{component_losses['text_presence']:.4f} | "
+        f"{component_losses['text_boundary']:.4f} | "
         f"{component_losses['class']:.4f} | "
         f"{component_losses['ctc']:.4f} | "
         f"{average_loss:.4f}"
@@ -226,6 +227,13 @@ criterion = build_criterion(
     text_bbox_coef=config["text_bbox_coef"],
     text_giou_coef=config["text_giou_coef"],
     text_presence_coef=config["text_presence_coef"],
+    text_cardinality_boundary_coef=config[
+        "text_cardinality_boundary_coef"
+    ],
+    text_cardinality_boundary_margin=config[
+        "text_cardinality_boundary_margin"
+    ],
+    text_presence_threshold=config["text_presence_threshold"],
     ctc_coef=config["ctc_weight"],
 ).to(device)
 print(f"检查点轮次：{checkpoint.get('epoch', '未知')}")
@@ -249,6 +257,7 @@ component_loss_sums = {
     "symbol_box": 0.0,
     "text_box": 0.0,
     "text_presence": 0.0,
+    "text_boundary": 0.0,
     "class": 0.0,
     "ctc": 0.0,
 }
@@ -302,6 +311,9 @@ with torch.no_grad():
         component_loss_sums["class"] += losses["loss_class"].item()
         component_loss_sums["text_presence"] += losses[
             "loss_text_presence"
+        ].item()
+        component_loss_sums["text_boundary"] += losses[
+            "loss_text_cardinality_boundary"
         ].item()
         component_loss_sums["ctc"] += losses[
             "loss_text_ctc"

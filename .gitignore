@@ -3,6 +3,7 @@
 debug
 outputs
 tmp
+datasets/p_id/
 *.pt
 *.pth
 !weights/*.pth

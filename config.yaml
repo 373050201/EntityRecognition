@@ -49,10 +49,10 @@ max_grad_norm: 0.1
 
 text_bbox_coef: 10.0
 text_giou_coef: 4.0
-text_presence_coef: 1.0
-# 仅抑制未匹配槽位复制已匹配文字框；IoU停止梯度，不改变推理结构。
-text_duplicate_coef: 0.5
-text_duplicate_iou_threshold: 0.5
+text_presence_coef: 2.0
+# 实验六：按真实文字数量分组等权约束第K与第K+1个槽位的推理边界。
+text_cardinality_boundary_coef: 0.1
+text_cardinality_boundary_margin: 0.2
 ctc_weight: 1.0
 
 # 第一轮先让图元框和三个文字槽位稳定，再把CTC损失加入反向传播。
@@ -66,4 +66,4 @@ symbol_iou_threshold: 0.5
 text_iou_threshold: 0.5
 text_presence_threshold: 0.362
 
-patience: 15
+patience: 20

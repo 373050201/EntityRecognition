@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from torch import nn
-from torchvision.ops import box_iou, generalized_box_iou
+from torchvision.ops import generalized_box_iou
 from utils import CTC_BLANK_INDEX, cxcywh_to_xyxy, encode_texts
 
 
@@ -28,8 +28,9 @@ class EntityRTDETRCriterion(nn.Module):
         text_bbox_coef=5.0,
         text_giou_coef=2.0,
         text_presence_coef=1.0,
-        text_duplicate_coef=0.5,
-        text_duplicate_iou_threshold=0.5,
+        text_cardinality_boundary_coef=0.0,
+        text_cardinality_boundary_margin=0.2,
+        text_presence_threshold=0.5,
         ctc_coef=1.0,
     ):
         super().__init__()
@@ -37,9 +38,24 @@ class EntityRTDETRCriterion(nn.Module):
         self.text_bbox_coef = text_bbox_coef
         self.text_giou_coef = text_giou_coef
         self.text_presence_coef = text_presence_coef
-        self.text_duplicate_coef = text_duplicate_coef
-        self.text_duplicate_iou_threshold = text_duplicate_iou_threshold
+        self.text_cardinality_boundary_coef = (
+            text_cardinality_boundary_coef
+        )
+        self.text_cardinality_boundary_margin = (
+            text_cardinality_boundary_margin
+        )
+        self.text_presence_threshold = text_presence_threshold
         self.ctc_coef = ctc_coef
+
+        if self.text_cardinality_boundary_coef < 0:
+            raise ValueError("文字基数边界损失权重不能小于0")
+        if self.text_cardinality_boundary_margin < 0:
+            raise ValueError("文字基数边界间隔不能小于0")
+        if not 0 < self.text_presence_threshold < 1:
+            raise ValueError("文字槽位阈值必须位于(0, 1)")
+        self.text_presence_logit_threshold = torch.logit(
+            torch.tensor(float(self.text_presence_threshold))
+        ).item()
 
         self.detector_matcher = HungarianMatcher(
             weight_dict={"cost_class": 2.0, "cost_bbox": 5.0, "cost_giou": 2.0},
@@ -65,7 +81,7 @@ class EntityRTDETRCriterion(nn.Module):
             "loss_symbol_bbox": 1.0,
             "loss_symbol_giou": 1.0,
             "loss_text_presence": 1.0,
-            "loss_text_duplicate": 1.0,
+            "loss_text_cardinality_boundary": 1.0,
             "loss_text_bbox": 1.0,
             "loss_text_giou": 1.0,
             "loss_text_aux": 1.0,
@@ -205,6 +221,81 @@ class EntityRTDETRCriterion(nn.Module):
             supervised_slots += source_logits.numel()
         return loss / max(supervised_slots, 1) * self.text_presence_coef
 
+    def _loss_text_cardinality_boundary(self, outputs, targets, indices):
+        """按真实文字数量均衡约束固定推理阈值处的Top-K边界。"""
+        logits = outputs["pred_text_presence"]
+        device = logits.device
+        num_text_slots = logits.shape[-1]
+        group_losses = [
+            logits.sum() * 0
+            for _ in range(num_text_slots + 1)
+        ]
+        group_boundary_counts = [0] * (num_text_slots + 1)
+
+        for batch_index, (query_indices, target_indices) in enumerate(indices):
+            if len(query_indices) == 0:
+                continue
+            target_indices = target_indices.cpu()
+            supervision_mask = targets[batch_index]["text_supervision"][
+                target_indices
+            ]
+            if not supervision_mask.any():
+                continue
+
+            query_indices = query_indices.to(device)[supervision_mask.to(device)]
+            target_indices = target_indices[supervision_mask]
+            source_logits = logits[batch_index, query_indices]
+            target_counts = targets[batch_index]["text_valid"][
+                target_indices
+            ].sum(dim=-1).to(device=device, dtype=torch.long)
+            sorted_logits = source_logits.sort(dim=-1, descending=True).values
+
+            for target_count in range(num_text_slots + 1):
+                count_mask = target_counts == target_count
+                entity_count = int(count_mask.sum().item())
+                if entity_count == 0:
+                    continue
+                group_logits = sorted_logits[count_mask]
+
+                if target_count > 0:
+                    positive_logits = group_logits[:, target_count - 1]
+                    group_losses[target_count] = (
+                        group_losses[target_count]
+                        + F.softplus(
+                            self.text_presence_logit_threshold
+                            + self.text_cardinality_boundary_margin
+                            - positive_logits
+                        ).sum()
+                    )
+                    group_boundary_counts[target_count] += entity_count
+
+                if target_count < num_text_slots:
+                    negative_logits = group_logits[:, target_count]
+                    group_losses[target_count] = (
+                        group_losses[target_count]
+                        + F.softplus(
+                            negative_logits
+                            - self.text_presence_logit_threshold
+                            + self.text_cardinality_boundary_margin
+                        ).sum()
+                    )
+                    group_boundary_counts[target_count] += entity_count
+
+        group_means = [
+            group_loss / boundary_count
+            for group_loss, boundary_count in zip(
+                group_losses,
+                group_boundary_counts,
+            )
+            if boundary_count > 0
+        ]
+        if not group_means:
+            return logits.sum() * 0
+        return (
+            torch.stack(group_means).mean()
+            * self.text_cardinality_boundary_coef
+        )
+
     def _loss_text_boxes(self, outputs, targets, text_matches):
         device = outputs["pred_text_boxes"].device
         source_box_groups = []
@@ -251,57 +342,6 @@ class EntityRTDETRCriterion(nn.Module):
             * self.text_giou_coef
         )
         return loss_bbox, loss_giou
-
-    def _loss_text_duplicates(self, outputs, text_matches):
-        """用重复框IoU加权未匹配槽位的有效概率，且不更新文字框。"""
-        logits = outputs["pred_text_presence"]
-        text_boxes = outputs["pred_text_boxes"]
-        loss = logits.sum() * 0
-        unmatched_slot_count = 0
-        num_text_slots = logits.shape[-1]
-
-        for batch_index, matches in enumerate(text_matches):
-            for query_index in matches["query_indices"].unique().tolist():
-                query_mask = matches["query_indices"] == query_index
-                matched_slots = matches["slot_indices"][query_mask]
-                unmatched_mask = torch.ones(
-                    num_text_slots,
-                    dtype=torch.bool,
-                    device=logits.device,
-                )
-                unmatched_mask[matched_slots] = False
-                unmatched_slots = torch.where(unmatched_mask)[0]
-                if len(unmatched_slots) == 0:
-                    continue
-
-                # IoU只提供重复程度，不允许该损失通过移动文字框来下降。
-                with torch.no_grad():
-                    query_boxes = cxcywh_to_xyxy(
-                        text_boxes[batch_index, query_index]
-                    ).float()
-                    duplicate_ious = box_iou(
-                        query_boxes[unmatched_slots],
-                        query_boxes[matched_slots],
-                    ).amax(dim=1)
-                    duplicate_weights = (
-                        duplicate_ious - self.text_duplicate_iou_threshold
-                    ).clamp(min=0)
-
-                unmatched_probabilities = logits[
-                    batch_index,
-                    query_index,
-                    unmatched_slots,
-                ].sigmoid()
-                loss = loss + (
-                    unmatched_probabilities * duplicate_weights
-                ).sum()
-                unmatched_slot_count += len(unmatched_slots)
-
-        return (
-            loss
-            / max(unmatched_slot_count, 1)
-            * self.text_duplicate_coef
-        )
 
     def _loss_texts(self, outputs, targets, text_matches):
         text_logits = outputs.get("pred_text_logits")
@@ -384,9 +424,12 @@ class EntityRTDETRCriterion(nn.Module):
             indices,
             text_matches,
         )
-        loss_text_duplicate = self._loss_text_duplicates(
-            outputs,
-            text_matches,
+        loss_text_cardinality_boundary = (
+            self._loss_text_cardinality_boundary(
+                outputs,
+                targets,
+                indices,
+            )
         )
         loss_text_bbox, loss_text_giou = self._loss_text_boxes(
             outputs,
@@ -417,7 +460,9 @@ class EntityRTDETRCriterion(nn.Module):
             "loss_symbol_bbox": detector_losses["loss_bbox"],
             "loss_symbol_giou": detector_losses["loss_giou"],
             "loss_text_presence": loss_text_presence,
-            "loss_text_duplicate": loss_text_duplicate,
+            "loss_text_cardinality_boundary": (
+                loss_text_cardinality_boundary
+            ),
             "loss_text_bbox": loss_text_bbox,
             "loss_text_giou": loss_text_giou,
             "loss_text_aux": loss_text_aux,
@@ -433,8 +478,9 @@ def build_criterion(
     text_bbox_coef=5.0,
     text_giou_coef=2.0,
     text_presence_coef=1.0,
-    text_duplicate_coef=0.5,
-    text_duplicate_iou_threshold=0.5,
+    text_cardinality_boundary_coef=0.0,
+    text_cardinality_boundary_margin=0.2,
+    text_presence_threshold=0.5,
     ctc_coef=1.0,
 ):
     return EntityRTDETRCriterion(
@@ -442,7 +488,8 @@ def build_criterion(
         text_bbox_coef=text_bbox_coef,
         text_giou_coef=text_giou_coef,
         text_presence_coef=text_presence_coef,
-        text_duplicate_coef=text_duplicate_coef,
-        text_duplicate_iou_threshold=text_duplicate_iou_threshold,
+        text_cardinality_boundary_coef=text_cardinality_boundary_coef,
+        text_cardinality_boundary_margin=text_cardinality_boundary_margin,
+        text_presence_threshold=text_presence_threshold,
         ctc_coef=ctc_coef,
     )
